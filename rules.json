@@ -1,0 +1,32 @@
+{
+    "engine_config": {
+        "lambda": 0.05,
+        "k": 0.10,
+        "x_0": 50.0,
+        "kill_threshold": 0.92,
+        "backprop_factor": 0.25,
+        "backprop_max_depth": 3,
+        "raw_score_cap": 500.0,
+        "tick_ms": 250,
+        "gc_dead_ttl_sec": 30.0,
+        "gc_tomb_risk_floor": 0.10
+    },
+    "event_weights": {
+        "ev_fork": 2,
+        "ev_exit": 1,
+        "ev_exec": 8,
+        "ev_mprotect_wx": 55,
+        "ev_memfd_create": 60,
+        "ev_prctl_rename": 40,
+        "ev_ptrace": 80,
+        "ev_commit_creds": 100,
+        "ev_unshare": 35,
+        "ev_sec_bpf": 50,
+        "ev_tcp_connect": 10
+    },
+    "context_multipliers": {
+        "uid_0": 1.5,
+        "cross_ns": 1.3,
+        "short_lived": 1.2
+    }
+}

@@ -1,0 +1,60 @@
+#ifndef EDR_COMMON_H
+#define EDR_COMMON_H
+
+#ifdef EDR_BPF_SIDE
+#include "vmlinux.h"
+#else
+#include <linux/types.h>
+#endif
+
+#define MAX_ARG_LEN 256
+#define MAX_COMM 16
+#define MAX_NAME 64
+
+enum edr_ev_type {
+    EV_FORK          = 1,
+    EV_EXIT          = 2,
+    EV_EXEC          = 3,
+    EV_MPROTECT_WX   = 4,
+    EV_MEMFD_CREATE  = 5,
+    EV_PRCTL_RENAME  = 6,
+    EV_PTRACE        = 7,
+    EV_COMMIT_CREDS  = 8,
+    EV_UNSHARE       = 9,
+    EV_SEC_BPF       = 10,
+    EV_TCP_CONNECT   = 11
+};
+
+struct exec_ctx {
+    __u64 ts_ns;
+    __u32 pid;
+    __u32 tgid;
+    char  args[MAX_ARG_LEN];
+} __attribute__((aligned(8)));
+
+struct edr_event {
+    __u8  ev_type;
+    __u8  _pad0[7];
+    __u64 ts_ns;
+    __u32 pid;
+    __u32 tgid;
+    __u32 ppid;
+    __u32 pgid;
+    __u32 uid;
+    __u32 ns_inum;
+    __u32 _pad1;
+    char  comm[MAX_COMM];
+    union {
+        struct { char argbuf[MAX_ARG_LEN]; } exec;
+        struct { __u64 addr; __u64 len; __u32 prot; __u32 _p; } mprot;
+        struct { __u32 ret_fd; __u32 _p; char name[MAX_NAME]; } memfd;
+        struct { char new_name[MAX_COMM]; } rename;
+        struct { __u32 tgt_pid; __u32 req; } ptrace_ev;
+        struct { __u32 old_uid; __u32 new_uid; } creds;
+        struct { __u32 flags; __u32 _p; } unshare_ev;
+        struct { __u32 daddr; __u16 dport; __u16 _p; __u32 saddr; } net;
+        __u8  _raw[MAX_ARG_LEN];
+    } data __attribute__((aligned(8)));
+} __attribute__((aligned(8)));
+
+#endif
