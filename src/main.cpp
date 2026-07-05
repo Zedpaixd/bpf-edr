@@ -74,7 +74,9 @@ int main(int argc, char **argv) {
     bump_rlim();
 
     std::uint32_t opgid = static_cast<std::uint32_t>(getpgid(0));
-    auto tr = std::make_shared<Tracker>(*cfg_opt, opgid);
+    std::uint32_t opid  = static_cast<std::uint32_t>(getpid());
+    auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid);
+    tr->seed_from_proc();
     g_tr = tr.get();
 
     if (access("/sys/kernel/tracing/events/sched/sched_process_fork/id", F_OK) != 0) {

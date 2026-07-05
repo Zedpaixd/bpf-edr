@@ -1,32 +1,41 @@
 {
     "engine_config": {
-        "lambda": 0.05,
-        "k": 0.10,
-        "x_0": 50.0,
+        "prior_logodds": -6.0,
+        "seeded_prior_extra": -2.0,
+        "corrob_coeff": 1.2,
+        "active_floor": 0.6,
         "kill_threshold": 0.92,
-        "backprop_factor": 0.25,
+        "backprop_factor": 0.15,
         "backprop_max_depth": 3,
-        "raw_score_cap": 500.0,
+        "warmup_sec": 15.0,
+        "dwell_sec": 4.0,
         "tick_ms": 250,
-        "gc_dead_ttl_sec": 30.0,
-        "gc_tomb_risk_floor": 0.10
+        "gc_base_ttl_sec": 30.0,
+        "gc_peak_ttl_coeff": 60.0,
+        "gc_tomb_risk_floor": 0.10,
+        "gc_forensic_keep": 0.40
     },
-    "event_weights": {
-        "ev_fork": 2,
-        "ev_exit": 1,
-        "ev_exec": 8,
-        "ev_mprotect_wx": 55,
-        "ev_memfd_create": 60,
-        "ev_prctl_rename": 40,
-        "ev_ptrace": 80,
-        "ev_commit_creds": 100,
-        "ev_unshare": 35,
-        "ev_sec_bpf": 50,
-        "ev_tcp_connect": 10
+    "categories": {
+        "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },
+        "execution": { "max_llr": 2.0, "scale": 2.5, "half_life_sec": 45.0 },
+        "memory":    { "max_llr": 3.0, "scale": 2.0, "half_life_sec": 60.0 },
+        "privilege": { "max_llr": 3.0, "scale": 2.0, "half_life_sec": 60.0 },
+        "evasion":   { "max_llr": 2.5, "scale": 2.5, "half_life_sec": 45.0 },
+        "c2":        { "max_llr": 1.5, "scale": 1.5, "half_life_sec": 30.0 }
     },
-    "context_multipliers": {
-        "uid_0": 1.5,
-        "cross_ns": 1.3,
-        "short_lived": 1.2
-    }
+    "event_llr": {
+        "ev_fork": 0.3, "ev_exit": 0.1, "ev_exec": 1.2,
+        "ev_memfd_create": 2.0, "ev_mprotect_wx": 2.5, "ev_ptrace": 2.5,
+        "ev_commit_creds": 3.0, "ev_unshare": 1.5, "ev_prctl_rename": 2.0,
+        "ev_sec_bpf": 1.5, "ev_tcp_connect": 1.0
+    },
+    "context_multipliers": { "uid_0": 1.5, "cross_ns": 1.3, "short_lived": 1.2 },
+    "masquerade_names": [
+        "kworker", "systemd", "sshd", "init", "kthreadd", "ksoftirqd",
+        "migration", "rcu_", "kswapd", "cron", "dbus", "kauditd", "khugepaged"
+    ],
+    "exempt_comms": [
+        "bash", "sh", "dash", "zsh", "fish", "ksh", "ash",
+        "sudo", "su", "login", "systemd", "init"
+    ]
 }
