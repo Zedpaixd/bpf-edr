@@ -39,6 +39,7 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
         gd("seeded_prior_extra", c.seeded_prior_extra);
         gd("corrob_coeff", c.corrob_coeff);
         gd("active_floor", c.active_floor);
+        gd("badge_floor", c.badge_floor);
         gd("kill_threshold", c.kill_threshold);
         gd("backprop_factor", c.backprop_factor);
         gi("backprop_max_depth", c.backprop_max_depth);
@@ -76,6 +77,15 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
         for (auto &v : j["exempt_comms"]) c.exempt_comms.push_back(v.get<std::string>());
     }
 
+    if (j.contains("prompt_config")) {
+        auto &p = j["prompt_config"];
+        if (p.contains("enabled")) c.prompt_enabled = p["enabled"].get<bool>();
+        if (p.contains("prompt_threshold")) c.prompt_threshold = p["prompt_threshold"].get<double>();
+        if (p.contains("auto_kill_enabled")) c.auto_kill_enabled = p["auto_kill_enabled"].get<bool>();
+        if (p.contains("allow_action")) c.allow_action = p["allow_action"].get<std::string>();
+        if (p.contains("deny_action")) c.deny_action = p["deny_action"].get<std::string>();
+        if (p.contains("kill_action")) c.kill_action = p["kill_action"].get<std::string>();
+    }
     return c;
 }
 

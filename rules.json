@@ -4,6 +4,7 @@
         "seeded_prior_extra": -2.0,
         "corrob_coeff": 1.2,
         "active_floor": 0.6,
+        "badge_floor": 0.20,
         "kill_threshold": 0.92,
         "backprop_factor": 0.15,
         "backprop_max_depth": 3,
@@ -14,6 +15,15 @@
         "gc_peak_ttl_coeff": 60.0,
         "gc_tomb_risk_floor": 0.10,
         "gc_forensic_keep": 0.40
+    },
+    "prompt_config": {
+        "enabled": true,
+        "prompt_threshold": 0.70,
+        "auto_kill_enabled": false,
+        "allow_action": "none",
+        "deny_action": "freeze",
+        "kill_action": "kill",
+        "_action_options": "none | whitelist | freeze | kill"
     },
     "categories": {
         "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },
@@ -36,6 +46,8 @@
     ],
     "exempt_comms": [
         "bash", "sh", "dash", "zsh", "fish", "ksh", "ash",
-        "sudo", "su", "login", "systemd", "init"
+        "python", "python3", "perl", "ruby", "node", "env",
+        "sudo", "su", "login", "systemd", "init",
+        "init(kali-linux", "SessionLeader", "Relay", "wsl", "wslhost"
     ]
 }

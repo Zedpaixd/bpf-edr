@@ -15,6 +15,22 @@ static constexpr double WATCH_THRESHOLD = 0.40;
 static constexpr std::size_t WATCH_MAX = 20;
 static constexpr std::size_t MASQ_CAP = 100;
 
+enum PromptAct { PA_NONE = 0, PA_WHITELIST, PA_FREEZE, PA_KILL };
+
+static const struct { const char *name; const char *desc; } PROMPT_ACTIONS[] = {
+    { "none",      "no action; let the process keep running" },
+    { "whitelist", "allow this session; stop scoring & prompting" },
+    { "freeze",    "SIGSTOP the process group (suspend, reversible)" },
+    { "kill",      "SIGKILL the process group (terminate)" },
+};
+
+static int act_index(const std::string &s) {
+    int n = (int)(sizeof(PROMPT_ACTIONS) / sizeof(PROMPT_ACTIONS[0]));
+    for (int i = 0; i < n; i++) if (s == PROMPT_ACTIONS[i].name) return i;
+    return PA_NONE;
+}
+static const char *act_desc(const std::string &s) { return PROMPT_ACTIONS[act_index(s)].desc; }
+
 static double now_sec() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -50,9 +66,16 @@ Tracker::Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid)
     : cfg_(std::move(cfg)), own_pgid_(own_pgid), own_pid_(own_pid) {
     start_ts_ = now_sec();
     if (cfg_.exempt_comms.empty()) {
-        cfg_.exempt_comms = { "bash", "sh", "dash", "zsh", "fish", "ksh",
-                              "ash", "sudo", "su", "login", "systemd", "init" };
+        cfg_.exempt_comms = { "bash", "sh", "dash", "zsh", "fish", "ksh", "ash",
+                              "python", "python3", "perl", "ruby", "node", "env",
+                              "sudo", "su", "login", "systemd", "init",
+                              "init(kali-linux", "SessionLeader", "Relay" };
     }
+}
+
+double Tracker::warmup_remaining() const {
+    double r = cfg_.warmup_sec - (now_sec() - start_ts_);
+    return r > 0.0 ? r : 0.0;
 }
 
 std::string Tracker::mk_uid(std::uint32_t tgid, std::uint64_t ts_ns) const {
@@ -79,18 +102,15 @@ std::string Tracker::ev_key(std::uint8_t t) const {
 bool Tracker::self_pid(std::uint32_t pid, std::uint32_t pgid) const {
     return pid == own_pid_ || pgid == own_pgid_;
 }
-
 bool Tracker::is_self(const edr_event &e) const {
     return e.tgid == own_pid_ || self_pid(e.pid, e.pgid);
 }
-
 bool Tracker::is_exempt_comm(const char *nm) const {
     if (!nm || !nm[0]) return false;
     for (auto &pat : cfg_.exempt_comms)
         if (std::strncmp(nm, pat.c_str(), MAX_COMM) == 0) return true;
     return false;
 }
-
 bool Tracker::is_masq_name(const char *nm) const {
     if (!nm || !nm[0]) return false;
     for (auto &pat : cfg_.masq_names)
@@ -278,6 +298,35 @@ void Tracker::backprop(const std::shared_ptr<ProcNode> &n, int cat, double amoun
     backprop(p, cat, prop, depth + 1, now);
 }
 
+std::shared_ptr<ProcNode> Tracker::responsible_launcher(const std::shared_ptr<ProcNode> &src) {
+    auto node = src->parent.lock();
+    std::shared_ptr<ProcNode> launcher;
+    int guard = 0;
+    while (node && guard++ < 256) {
+        if (!node->exempt) launcher = node;
+        node = node->parent.lock();
+    }
+    return launcher;
+}
+
+void Tracker::recompute_badges() {
+    for (auto &kv : nodes_) if (kv.second) kv.second->badge_risk = 0.0;
+    for (auto &kv : nodes_) {
+        auto &n = kv.second;
+        if (!n || n->exempt) continue;
+        if (n->risk_pct < cfg_.badge_floor) continue;
+        auto L = responsible_launcher(n);
+        if (L && !L->exempt && L.get() != n.get()) {
+            if (n->risk_pct > L->badge_risk) L->badge_risk = n->risk_pct;
+        }
+    }
+    for (auto &kv : nodes_) {
+        auto &n = kv.second;
+        if (!n) continue;
+        if (n->badge_risk > n->badge_peak) n->badge_peak = n->badge_risk;
+    }
+}
+
 std::string Tracker::active_stages(const std::shared_ptr<ProcNode> &n) const {
     static const char L[CAT_COUNT] = { 'L', 'X', 'M', 'P', 'E', 'C' };
     std::string s;
@@ -288,14 +337,85 @@ std::string Tracker::active_stages(const std::shared_ptr<ProcNode> &n) const {
     return s;
 }
 
+std::string Tracker::describe_stages(const std::shared_ptr<ProcNode> &n) const {
+    static const struct { char c; const char *phrase; } M[] = {
+        {'X', "fileless/in-memory exec"}, {'M', "W^X memory / injection"},
+        {'P', "privilege/namespace escalation"}, {'E', "masquerade / BPF tamper"},
+        {'C', "outbound network (C2?)"}, {'L', "rapid process spawning"},
+    };
+    std::string st = active_stages(n);
+    std::string out;
+    for (auto &m : M) {
+        if (st.find(m.c) != std::string::npos) {
+            if (!out.empty()) out += " + ";
+            out += m.phrase;
+        }
+    }
+    if (out.empty()) out = "suspicious syscall activity";
+    return out;
+}
+
 std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
     std::string origin(n->comm, ::strnlen(n->comm, MAX_COMM));
     auto cur = n->parent.lock();
-    while (cur) {
+    int guard = 0;
+    while (cur && guard++ < 256) {
         if (!cur->exempt) origin.assign(cur->comm, ::strnlen(cur->comm, MAX_COMM));
         cur = cur->parent.lock();
     }
     return origin;
+}
+
+void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n) {
+    PromptReq r;
+    r.uid = n->uid; r.pid = n->pid; r.pgid = n->pgid;
+    r.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+    r.doing = describe_stages(n);
+    r.risk = n->risk_pct;
+    r.allow_lbl = act_desc(cfg_.allow_action);
+    r.deny_lbl = act_desc(cfg_.deny_action);
+    r.kill_lbl = act_desc(cfg_.kill_action);
+    std::lock_guard<std::mutex> lk(prompt_mtx_);
+    if (prompt_q_.size() < 32) prompt_q_.push_back(std::move(r));
+}
+
+std::optional<PromptReq> Tracker::take_prompt() {
+    std::lock_guard<std::mutex> lk(prompt_mtx_);
+    if (prompt_q_.empty()) return std::nullopt;
+    PromptReq r = prompt_q_.front();
+    prompt_q_.pop_front();
+    return r;
+}
+
+void Tracker::resolve_prompt(const std::string &uid, char decision) {
+    std::string action = (decision == 'y') ? cfg_.allow_action
+                       : (decision == 'n') ? cfg_.deny_action
+                                           : cfg_.kill_action;
+    int a = act_index(action);
+    std::uint32_t pgid = 0; std::string comm;
+    {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto it = nodes_.find(uid);
+        if (it != nodes_.end() && it->second) {
+            pgid = it->second->pgid;
+            comm.assign(it->second->comm, ::strnlen(it->second->comm, MAX_COMM));
+            if (a == PA_WHITELIST) it->second->exempt = true;
+        }
+    }
+    const char *dn = (decision == 'y') ? "ALLOW" : (decision == 'n') ? "DENY" : "KILL";
+    bool actionable = (pgid > 1 && pgid != own_pgid_);
+    if (a == PA_FREEZE && actionable) {
+        ::kill(-static_cast<pid_t>(pgid), SIGSTOP);
+        log_alert(std::string("[") + dn + "->FREEZE] pgid=" + std::to_string(pgid) + " " + comm + " suspended (SIGSTOP)");
+    } else if (a == PA_KILL && actionable) {
+        ::kill(-static_cast<pid_t>(pgid), SIGKILL);
+        kills_.fetch_add(1);
+        log_alert(std::string("[") + dn + "->KILL] pgid=" + std::to_string(pgid) + " " + comm + " terminated (SIGKILL)");
+    } else if (a == PA_WHITELIST) {
+        log_alert(std::string("[") + dn + "->WHITELIST] " + comm + " allowed for session");
+    } else {
+        log_alert(std::string("[") + dn + "->NONE] " + comm + " no action taken");
+    }
 }
 
 void Tracker::update_watchlist(const std::shared_ptr<ProcNode> &n) {
@@ -326,8 +446,8 @@ void Tracker::update_watchlist(const std::shared_ptr<ProcNode> &n) {
         it->second.child_count = n->children.size();
         it->second.is_dead = n->is_dead;
         it->second.stages = active_stages(n);
-        it->second.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
         it->second.origin = compute_origin(n);
+        it->second.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
     }
 }
 
@@ -412,18 +532,29 @@ void Tracker::mitigate(std::shared_ptr<ProcNode> n) {
     if (pgid <= 1) return;
     if (pgid == own_pgid_) return;
     n->kill_flagged = true;
-    kills_.fetch_add(1);
-    char msg[192];
-    std::snprintf(msg, sizeof(msg),
-        "[WOULD-KILL] pgid=%u pid=%u comm=%s risk=%.1f%% (kill disabled)",
-        pgid, n->pid, n->comm, n->risk_pct * 100.0);
-    log_alert(msg);
-    // TO RE-ENABLE MITIGATION, uncomment:
-    // if (::kill(-static_cast<pid_t>(pgid), SIGKILL) == 0) {
-    //     n->is_dead = true; n->died_ts = now_sec();
-    //     auto wit = watchlist_.find(n->uid);
-    //     if (wit != watchlist_.end()) wit->second.is_dead = true;
-    // }
+    if (cfg_.auto_kill_enabled) {
+        if (::kill(-static_cast<pid_t>(pgid), SIGKILL) == 0) {
+            kills_.fetch_add(1);
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "[AUTO-KILL] pgid=%u pid=%u comm=%s risk=%.1f%% EXECUTED",
+                pgid, n->pid, n->comm, n->risk_pct * 100.0);
+            log_alert(msg);
+            n->is_dead = true; n->died_ts = now_sec();
+            auto wit = watchlist_.find(n->uid);
+            if (wit != watchlist_.end()) wit->second.is_dead = true;
+        } else {
+            char msg[160];
+            std::snprintf(msg, sizeof(msg), "[AUTO-KILL] pgid=%u FAILED errno=%d", pgid, errno);
+            log_alert(msg);
+        }
+    } else {
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+            "[WOULD-KILL] pgid=%u pid=%u comm=%s risk=%.1f%% (auto_kill disabled)",
+            pgid, n->pid, n->comm, n->risk_pct * 100.0);
+        log_alert(msg);
+    }
 }
 
 void Tracker::detach_from_parent(const std::shared_ptr<ProcNode> &n) {
@@ -443,10 +574,12 @@ void Tracker::gc_sweep(double now_s) {
     for (auto &kv : nodes_) {
         auto &n = kv.second;
         if (!n || !n->is_dead) continue;
-        if (n->peak_risk_pct >= cfg_.gc_forensic_keep) continue;
-        double ttl = cfg_.gc_base_ttl_sec + cfg_.gc_peak_ttl_coeff * n->peak_risk_pct;
+        double keep_metric = std::max(n->peak_risk_pct, n->badge_peak);
+        if (keep_metric >= cfg_.gc_forensic_keep) continue;
+        double ttl = cfg_.gc_base_ttl_sec + cfg_.gc_peak_ttl_coeff * keep_metric;
         double ddt = now_s - n->died_ts;
-        if (n->risk_pct < cfg_.gc_tomb_risk_floor && ddt > ttl)
+        double live = std::max(n->risk_pct, n->badge_risk);
+        if (live < cfg_.gc_tomb_risk_floor && ddt > ttl)
             to_erase.push_back(n->uid);
     }
     for (auto &u : to_erase) {
@@ -469,14 +602,23 @@ void Tracker::tick() {
         std::unique_lock<std::shared_mutex> lk(g_lock_);
         for (auto &kv : nodes_) {
             auto &n = kv.second;
-            if (!n || n->is_dead || n->exempt) continue;
+            if (!n || n->exempt) continue;
             decay_to(n, t);
             recompute(n);
-            auto wit = watchlist_.find(n->uid);
-            if (wit != watchlist_.end()) {
-                wit->second.current_risk_pct = n->risk_pct;
-                wit->second.child_count = n->children.size();
-                wit->second.stages = active_stages(n);
+        }
+        recompute_badges();
+        for (auto &kv : nodes_) {
+            auto &n = kv.second;
+            if (!n || n->exempt) continue;
+            if (!n->is_dead) update_watchlist(n);
+            if (n->is_dead) continue;
+            if (cfg_.prompt_enabled) {
+                if (n->risk_pct >= cfg_.prompt_threshold && n->prompt_armed) {
+                    n->prompt_armed = false;
+                    enqueue_prompt(n);
+                } else if (n->risk_pct < cfg_.prompt_threshold - 0.10) {
+                    n->prompt_armed = true;
+                }
             }
             if (n->risk_pct >= cfg_.kill_threshold) {
                 if (n->above_since <= 0.0) n->above_since = t;
@@ -495,7 +637,8 @@ SnapNode Tracker::build_snap(const std::shared_ptr<ProcNode> &n) const {
     SnapNode s;
     s.pid = n->pid;
     s.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
-    s.risk_pct = n->risk_pct;
+    s.risk_pct = (n->is_dead && !n->exempt) ? n->peak_risk_pct : n->risk_pct;
+    s.badge_risk = n->exempt ? 0.0 : ((n->is_dead) ? n->badge_peak : n->badge_risk);
     s.is_dead = n->is_dead;
     s.is_new = n->is_new;
     s.exempt = n->exempt;
@@ -505,11 +648,12 @@ SnapNode Tracker::build_snap(const std::shared_ptr<ProcNode> &n) const {
 
 void Tracker::collect_top(const std::shared_ptr<ProcNode> &n, std::vector<TopEntry> &out) const {
     if (!n) return;
-    if (!n->is_dead && !n->exempt) {
+    if (!n->is_dead && !n->exempt && n->risk_pct > 0.01) {
         TopEntry e;
         e.pid = n->pid;
         e.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
         e.risk_pct = n->risk_pct;
+        e.origin = compute_origin(n);
         out.push_back(e);
     }
     for (auto &c : n->children) collect_top(c, out);
@@ -537,6 +681,7 @@ Snapshot Tracker::snapshot() const {
     for (auto &kv : watchlist_) s.watchlist.push_back(kv.second);
     std::sort(s.watchlist.begin(), s.watchlist.end(),
         [](const WatchEntry &a, const WatchEntry &b) { return a.peak_risk_pct > b.peak_risk_pct; });
+    s.watch_count = watchlist_.size();
     return s;
 }
 
@@ -550,5 +695,4 @@ std::vector<std::string> Tracker::tail_alerts(std::size_t n) const {
 }
 
 void Tracker::push_alert(const std::string &s) { log_alert(s); }
-
 void Tracker::stop() { running_.store(false); }

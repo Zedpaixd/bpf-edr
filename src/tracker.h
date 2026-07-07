@@ -8,6 +8,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
@@ -26,6 +27,8 @@ struct ProcNode {
     double logodds = 0.0;
     double risk_pct = 0.0;
     double peak_risk_pct = 0.0;
+    double badge_risk = 0.0;
+    double badge_peak = 0.0;
     double last_score_ts = 0.0;
     double last_ev_ts = 0.0;
     double created_ts = 0.0;
@@ -35,6 +38,7 @@ struct ProcNode {
     bool   is_new = false;
     bool   exempt = false;
     bool   kill_flagged = false;
+    bool   prompt_armed = true;
     std::weak_ptr<ProcNode> parent;
     std::vector<std::shared_ptr<ProcNode>> children;
 };
@@ -43,6 +47,7 @@ struct SnapNode {
     std::uint32_t pid = 0;
     std::string   comm;
     double        risk_pct = 0.0;
+    double        badge_risk = 0.0;
     bool          is_dead = false;
     bool          is_new = false;
     bool          exempt = false;
@@ -53,6 +58,7 @@ struct TopEntry {
     std::uint32_t pid = 0;
     std::string   comm;
     double        risk_pct = 0.0;
+    std::string   origin;
 };
 
 struct MasqEvent {
@@ -77,6 +83,18 @@ struct WatchEntry {
     bool          is_dead = false;
 };
 
+struct PromptReq {
+    std::string   uid;
+    std::uint32_t pid = 0;
+    std::uint32_t pgid = 0;
+    std::string   comm;
+    std::string   doing;
+    double        risk = 0.0;
+    std::string   allow_lbl;
+    std::string   deny_lbl;
+    std::string   kill_lbl;
+};
+
 struct Snapshot {
     std::vector<SnapNode>   roots;
     std::vector<TopEntry>   top3;
@@ -85,6 +103,7 @@ struct Snapshot {
     std::size_t total_nodes = 0;
     std::size_t live_nodes = 0;
     std::size_t new_nodes = 0;
+    std::size_t watch_count = 0;
 };
 
 class Tracker {
@@ -102,6 +121,10 @@ public:
     std::uint64_t hooks_failed() const { return hook_fails_.load(); }
     void note_hook_fail() { hook_fails_.fetch_add(1); }
     std::uint64_t ev_count() const { return ev_count_.load(); }
+    double warmup_remaining() const;
+    bool prompts_enabled() const { return cfg_.prompt_enabled; }
+    std::optional<PromptReq> take_prompt();
+    void resolve_prompt(const std::string &uid, char decision);
 
 private:
     EngineCfg cfg_;
@@ -116,6 +139,8 @@ private:
     std::unordered_map<std::string, WatchEntry> watchlist_;
     mutable std::mutex alert_lock_;
     std::deque<std::string> alerts_;
+    std::mutex prompt_mtx_;
+    std::deque<PromptReq> prompt_q_;
     std::atomic<bool> running_{true};
     std::atomic<std::uint64_t> kills_{0};
     std::atomic<std::uint64_t> hook_fails_{0};
@@ -135,8 +160,12 @@ private:
     void recompute(const std::shared_ptr<ProcNode> &n);
     void add_evidence(const std::shared_ptr<ProcNode> &n, int cat, double amount, double now);
     void backprop(const std::shared_ptr<ProcNode> &n, int cat, double amount, int depth, double now);
+    std::shared_ptr<ProcNode> responsible_launcher(const std::shared_ptr<ProcNode> &src);
+    void recompute_badges();
     std::string active_stages(const std::shared_ptr<ProcNode> &n) const;
+    std::string describe_stages(const std::shared_ptr<ProcNode> &n) const;
     std::string compute_origin(const std::shared_ptr<ProcNode> &n) const;
+    void enqueue_prompt(const std::shared_ptr<ProcNode> &n);
     void update_watchlist(const std::shared_ptr<ProcNode> &n);
     void log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new_name, bool susp);
     void log_alert(const std::string &s);

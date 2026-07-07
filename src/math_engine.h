@@ -28,6 +28,7 @@ struct EngineCfg {
     double seeded_prior_extra = -2.0;
     double corrob_coeff = 1.2;
     double active_floor = 0.6;
+    double badge_floor = 0.20;
     double kill_threshold = 0.92;
     double backprop_factor = 0.25;
     int    backprop_max_depth = 3;
@@ -45,7 +46,12 @@ struct EngineCfg {
     double ctx_short = 1.2;
     std::vector<std::string> masq_names;
     std::vector<std::string> exempt_comms;
-};
+    bool prompt_enabled = false;
+    double prompt_threshold = 0.70;
+    bool auto_kill_enabled = false;
+    std::string allow_action = "none";
+    std::string deny_action = "freeze";
+    std::string kill_action = "kill";};
 
 class MathEng {
 public:
