@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <bpf/bpf.h>
 
 static constexpr double WATCH_THRESHOLD = 0.40;
 static constexpr std::size_t WATCH_MAX = 20;
@@ -388,7 +389,82 @@ std::optional<PromptReq> Tracker::take_prompt() {
     return r;
 }
 
+bool Tracker::arm_block(std::uint32_t tgid) {
+    if (block_map_fd_ < 0 || tgid == 0) return false;
+    struct blk_val v{};
+    v.armed_ns = static_cast<std::uint64_t>(now_sec() * 1e9);
+    v.mode = 0;
+    return bpf_map_update_elem(block_map_fd_, &tgid, &v, BPF_ANY) == 0;
+}
+
+void Tracker::disarm_block(std::uint32_t tgid) {
+    if (block_map_fd_ < 0 || tgid == 0) return;
+    bpf_map_delete_elem(block_map_fd_, &tgid);
+}
+
+void Tracker::set_enforcement_fds(int block_fd, int switch_fd) {
+    block_map_fd_ = block_fd;
+    enforce_switch_fd_ = switch_fd;
+}
+
+void Tracker::set_enforcement(bool on) {
+    enforce_on_.store(on);
+    if (enforce_switch_fd_ >= 0) {
+        std::uint32_t k = 0, v = on ? 1u : 0u;
+        bpf_map_update_elem(enforce_switch_fd_, &k, &v, BPF_ANY);
+    }
+    log_alert(std::string("[LSM] enforcement ")
+              + (on ? "ENABLED" : "DISABLED (all blocks bypassed)"));
+}
+
+void Tracker::flush_blocks() {
+    if (block_map_fd_ >= 0) {
+        std::vector<std::uint32_t> keys;
+        std::uint32_t cur = 0, nxt = 0;
+        void *pk = nullptr;
+        while (bpf_map_get_next_key(block_map_fd_, pk, &nxt) == 0) {
+            keys.push_back(nxt); cur = nxt; pk = &cur;
+        }
+        for (auto k : keys) bpf_map_delete_elem(block_map_fd_, &k);
+    }
+    std::unique_lock<std::shared_mutex> lk(g_lock_);
+    for (auto &kv : nodes_) if (kv.second) kv.second->blocked = false;
+    log_alert("[LSM] all blocks cleared");
+}
+
+std::size_t Tracker::blocks_active() const {
+    std::shared_lock<std::shared_mutex> lk(g_lock_);
+    std::size_t n = 0;
+    for (auto &kv : nodes_)
+        if (kv.second && kv.second->blocked && !kv.second->is_dead) n++;
+    return n;
+}
+
 void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision) {
+    if (decision == 'b') {
+        std::string comm; std::uint32_t tgid = 0;
+        {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            auto it = nodes_.find(uid);
+            if (it != nodes_.end() && it->second) {
+                auto &n = it->second;
+                comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+                tgid = n->tgid;
+                if (pgid == 0) pgid = n->pgid;
+                n->prompt_pending = false;
+                n->frozen = false;
+                n->blocked = true;
+                n->last_score_ts = now_sec();
+            }
+        }
+        bool armed = arm_block(tgid);
+        if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+        log_alert(armed
+            ? "[BLOCK] " + comm + " resumed; risky syscalls denied in-kernel (LSM)"
+            : "[BLOCK] " + comm + " arm FAILED (enforcement unavailable)");
+        return;
+    }
+
     std::string action; const char *dn;
     switch (decision) {
         case 'y': action = cfg_.allow_action; dn = "ALLOW"; break;
@@ -399,20 +475,24 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
     }
     int a = act_index(action);
     std::string comm;
+    std::uint32_t tgid = 0;
     {
         std::unique_lock<std::shared_mutex> lk(g_lock_);
         auto it = nodes_.find(uid);
         if (it != nodes_.end() && it->second) {
             auto &n = it->second;
             comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+            tgid = n->tgid;
             if (pgid == 0) pgid = n->pgid;
             n->prompt_pending = false;
             n->last_score_ts = now_sec();
             if (a == PA_RESUME || a == PA_WHITELIST) n->frozen = false;
             if (a == PA_FREEZE) n->frozen = true;
-            if (a == PA_WHITELIST) n->exempt = true;
+            if (a == PA_WHITELIST) { n->exempt = true; n->blocked = false; }
         }
     }
+    if ((a == PA_WHITELIST || a == PA_KILL) && tgid != 0) disarm_block(tgid);
+
     bool ok = (pgid > 1 && pgid != own_pgid_);
     switch (a) {
         case PA_RESUME:
@@ -492,6 +572,24 @@ void Tracker::log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new
 
 void Tracker::ingest(const edr_event &e) {
     ev_count_.fetch_add(1);
+
+    if (e.ev_type == EV_LSM_DENY) {
+        denies_.fetch_add(1);
+        const char *k = "syscall";
+        switch (e.data.deny.klass) {
+            case DK_EXEC:    k = "execve";            break;
+            case DK_WX:      k = "W^X map/mprotect";  break;
+            case DK_SETUID:  k = "setuid->root";      break;
+            case DK_PTRACE:  k = "ptrace";            break;
+            case DK_CONNECT: k = "tcp connect";       break;
+        }
+        char msg[192];
+        std::snprintf(msg, sizeof(msg), "[LSM-DENY] pid=%u %s blocked %s (-EPERM)",
+                      e.pid, e.comm, k);
+        log_alert(msg);
+        return;
+    }
+
     std::unique_lock<std::shared_mutex> lk(g_lock_);
     std::shared_ptr<ProcNode> n;
     bool prctl_score = false;
@@ -505,6 +603,7 @@ void Tracker::ingest(const edr_event &e) {
             n->died_ts = ns_to_sec(e.ts_ns);
             auto wit = watchlist_.find(n->uid);
             if (wit != watchlist_.end()) wit->second.is_dead = true;
+            if (n->blocked) { n->blocked = false; disarm_block(n->tgid); }
         }
         return;
     } else {
@@ -669,6 +768,7 @@ SnapNode Tracker::build_snap(const std::shared_ptr<ProcNode> &n) const {
     s.is_new = n->is_new;
     s.exempt = n->exempt;
     s.frozen = n->frozen;
+    s.blocked = n->blocked;
     for (auto &c : n->children) if (c) s.children.push_back(build_snap(c));
     return s;
 }

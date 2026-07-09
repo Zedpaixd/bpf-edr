@@ -54,6 +54,14 @@ struct EngineCfg {
     std::string deny_action = "freeze";
     std::string kill_action = "kill";
     std::string whitelist_action = "whitelist";
+    bool enforce_enabled = true;
+    bool deny_exec = true;
+    bool deny_wx = true;
+    bool deny_setuid = true;
+    bool deny_ptrace = true;
+    bool deny_connect = true;
+    bool block_descendants = true;
+    bool emit_deny_events = true;
 };
 
 class MathEng {

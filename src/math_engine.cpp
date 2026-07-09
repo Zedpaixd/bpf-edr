@@ -76,7 +76,6 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
     if (j.contains("exempt_comms")) {
         for (auto &v : j["exempt_comms"]) c.exempt_comms.push_back(v.get<std::string>());
     }
-
     if (j.contains("prompt_config")) {
         auto &p = j["prompt_config"];
         if (p.contains("enabled")) c.prompt_enabled = p["enabled"].get<bool>();
@@ -87,6 +86,18 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
         if (p.contains("deny_action")) c.deny_action = p["deny_action"].get<std::string>();
         if (p.contains("kill_action")) c.kill_action = p["kill_action"].get<std::string>();
         if (p.contains("whitelist_action")) c.whitelist_action = p["whitelist_action"].get<std::string>();
+    }
+    if (j.contains("enforcement")) {
+        auto &en = j["enforcement"];
+        auto gb = [&](const char *k, bool &dst){ if (en.contains(k)) dst = en[k].get<bool>(); };
+        gb("enabled", c.enforce_enabled);
+        gb("deny_exec", c.deny_exec);
+        gb("deny_wx", c.deny_wx);
+        gb("deny_setuid", c.deny_setuid);
+        gb("deny_ptrace", c.deny_ptrace);
+        gb("deny_connect", c.deny_connect);
+        gb("block_descendants", c.block_descendants);
+        gb("emit_deny_events", c.emit_deny_events);
     }
     return c;
 }

@@ -24,8 +24,17 @@
         "allow_action": "resume",
         "deny_action": "freeze",
         "kill_action": "kill",
-        "whitelist_action": "whitelist",
-        "_action_options": "none | resume | freeze | kill | whitelist"
+        "whitelist_action": "whitelist"
+    },
+    "enforcement": {
+        "enabled": true,
+        "deny_exec": true,
+        "deny_wx": true,
+        "deny_setuid": true,
+        "deny_ptrace": true,
+        "deny_connect": true,
+        "block_descendants": true,
+        "emit_deny_events": true
     },
     "categories": {
         "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },

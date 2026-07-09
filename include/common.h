@@ -22,7 +22,16 @@ enum edr_ev_type {
     EV_COMMIT_CREDS  = 8,
     EV_UNSHARE       = 9,
     EV_SEC_BPF       = 10,
-    EV_TCP_CONNECT   = 11
+    EV_TCP_CONNECT   = 11,
+    EV_LSM_DENY      = 12
+};
+
+enum edr_deny_klass {
+    DK_EXEC    = 1,
+    DK_WX      = 2,
+    DK_SETUID  = 3,
+    DK_PTRACE  = 4,
+    DK_CONNECT = 5
 };
 
 struct exec_ctx {
@@ -30,6 +39,12 @@ struct exec_ctx {
     __u32 pid;
     __u32 tgid;
     char  args[MAX_ARG_LEN];
+} __attribute__((aligned(8)));
+
+struct blk_val {
+    __u64 armed_ns;
+    __u8  mode;
+    __u8  _pad[7];
 } __attribute__((aligned(8)));
 
 struct edr_event {
@@ -53,6 +68,7 @@ struct edr_event {
         struct { __u32 old_uid; __u32 new_uid; } creds;
         struct { __u32 flags; __u32 _p; } unshare_ev;
         struct { __u32 daddr; __u16 dport; __u16 _p; __u32 saddr; } net;
+        struct { __u8 klass; __u8 _p[7]; } deny;
         __u8  _raw[MAX_ARG_LEN];
     } data __attribute__((aligned(8)));
 } __attribute__((aligned(8)));

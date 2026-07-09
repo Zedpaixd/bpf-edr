@@ -40,6 +40,7 @@ struct ProcNode {
     bool   kill_flagged = false;
     bool   frozen = false;
     bool   prompt_pending = false;
+    bool   blocked = false;
     std::weak_ptr<ProcNode> parent;
     std::vector<std::shared_ptr<ProcNode>> children;
 };
@@ -53,6 +54,7 @@ struct SnapNode {
     bool          is_new = false;
     bool          exempt = false;
     bool          frozen = false;
+    bool          blocked = false;
     std::vector<SnapNode> children;
 };
 
@@ -130,6 +132,12 @@ public:
     bool prompts_enabled() const { return cfg_.prompt_enabled; }
     std::optional<PromptReq> take_prompt();
     void resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision);
+    void set_enforcement_fds(int block_fd, int switch_fd);
+    void set_enforcement(bool on);
+    void flush_blocks();
+    bool enforcement_on() const { return enforce_on_.load(); }
+    std::uint64_t denies() const { return denies_.load(); }
+    std::size_t blocks_active() const;
 
 private:
     EngineCfg cfg_;
@@ -150,6 +158,10 @@ private:
     std::atomic<std::uint64_t> kills_{0};
     std::atomic<std::uint64_t> hook_fails_{0};
     std::atomic<std::uint64_t> ev_count_{0};
+    int block_map_fd_ = -1;
+    int enforce_switch_fd_ = -1;
+    std::atomic<bool> enforce_on_{true};
+    std::atomic<std::uint64_t> denies_{0};
 
     std::string mk_uid(std::uint32_t tgid, std::uint64_t ts_ns) const;
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
@@ -178,6 +190,8 @@ private:
     void gc_sweep(double now_sec);
     void mitigate(std::shared_ptr<ProcNode> n);
     void detach_from_parent(const std::shared_ptr<ProcNode> &n);
+    bool arm_block(std::uint32_t tgid);
+    void disarm_block(std::uint32_t tgid);
 };
 
 #endif

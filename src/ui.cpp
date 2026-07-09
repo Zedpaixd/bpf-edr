@@ -26,6 +26,7 @@ struct FlatRow {
     bool is_anchor;
     bool exempt;
     bool frozen;
+    bool blocked;
 };
 
 Ui::Ui(std::shared_ptr<Tracker> t) : tr_(std::move(t)) {}
@@ -51,13 +52,13 @@ static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
                           bool anchor_used, std::vector<FlatRow> &out) {
     if (!n.exempt) {
         out.push_back({depth, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, n.is_new, false, false, n.frozen});
+                       n.is_dead, n.is_new, false, false, n.frozen, n.blocked});
         for (auto &c : n.children) collapse_walk(c, depth + 1, false, anchor_used, out);
     } else {
         bool anchor = (!anchor_used && !parent_exempt);
         if (anchor) {
             out.push_back({depth, n.pid, n.comm, n.risk_pct, 0.0,
-                           n.is_dead, n.is_new, true, true, false});
+                           n.is_dead, n.is_new, true, true, false, false});
             for (auto &c : n.children) collapse_walk(c, depth + 1, true, true, out);
         } else {
             for (auto &c : n.children) collapse_walk(c, depth, true, anchor_used, out);
@@ -68,7 +69,7 @@ static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
 static void newonly_walk(const SnapNode &n, std::vector<FlatRow> &out) {
     if (n.is_new && !n.exempt)
         out.push_back({0, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, true, false, false, n.frozen});
+                       n.is_dead, true, false, false, n.frozen, n.blocked});
     for (auto &c : n.children) newonly_walk(c, out);
 }
 
@@ -84,11 +85,13 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
     prefix += r.is_new ? "* " : "  ";
     std::string label = prefix + "[" + std::to_string(r.pid) + "] " + r.comm
                         + " - " + fmt_pct(r.risk_pct);
-    if (r.frozen) label += " (FROZEN)";
+    if (r.blocked) label += " (BLOCKED)";
+    else if (r.frozen) label += " (FROZEN)";
     else if (r.is_dead) label += " (dead)";
     if (r.is_anchor) label += "  <shell>";
     Color c;
-    if (r.frozen)         c = Color::Cyan;
+    if (r.blocked)        c = Color::Magenta;
+    else if (r.frozen)    c = Color::Cyan;
     else if (r.is_dead)   c = r.risk_pct >= 0.20 ? Color::Red : Color::GrayDark;
     else if (r.is_anchor) c = Color::GrayDark;
     else if (r.exempt)    c = Color::GrayLight;
@@ -96,7 +99,7 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
 
     Elements parts;
     Element base = text(hclip(label, hoff)) | color(c);
-    if (r.frozen) base = base | bold;
+    if (r.frozen || r.blocked) base = base | bold;
     parts.push_back(base);
     if (r.badge_risk > 0.05) {
         std::string chip = " sub " + fmt_pct(r.badge_risk) + " ";
@@ -197,7 +200,10 @@ static Element build_audit_pane(const std::vector<std::string> &lines, int hoff,
     } else {
         for (auto &s : lines) {
             Color c = Color::Yellow;
-            if (s.find("KILL") != std::string::npos) c = Color::Red;
+            if (s.find("LSM-DENY") != std::string::npos) c = Color::Magenta;
+            else if (s.find("[BLOCK]") != std::string::npos) c = Color::Magenta;
+            else if (s.find("[LSM]") != std::string::npos) c = Color::Cyan;
+            else if (s.find("KILL") != std::string::npos) c = Color::Red;
             else if (s.find("FREEZE") != std::string::npos) c = Color::Cyan;
             else if (s.find("RESUME") != std::string::npos) c = Color::Green;
             else if (s.find("WHITELIST") != std::string::npos) c = Color::Green;
@@ -228,6 +234,7 @@ static Element build_modal(const PromptReq &p) {
     v.push_back(separator());
     v.push_back(text("  [Y] allow -> " + p.allow_lbl) | color(Color::Green));
     v.push_back(text("  [N] deny  -> " + p.deny_lbl) | color(Color::Yellow));
+    v.push_back(text("  [B] block -> resume; deny risky syscalls in-kernel (LSM)") | color(Color::Magenta));
     v.push_back(text("  [K] kill  -> " + p.kill_lbl) | color(Color::Red));
     v.push_back(text("  [W] w-list-> " + p.wl_lbl) | color(Color::Cyan));
     v.push_back(text("  [Esc] dismiss (leave suspended, no action) ") | dim);
@@ -284,13 +291,16 @@ void Ui::run() {
         if (wr > 0.0) std::snprintf(armed, sizeof(armed), "WARMUP %.0fs", wr);
         else          std::snprintf(armed, sizeof(armed), "ARMED");
 
-        char status[300];
+        char status[360];
         std::snprintf(status, sizeof(status),
-            " EDR | ev=%llu %.0f/s | kills=%llu hookfail=%llu | watch=%zu frozen=%zu | %s | %s%s | wheel 0 n/a space q ",
+            " EDR | ev=%llu %.0f/s | kills=%llu dny=%llu hookfail=%llu | watch=%zu frozen=%zu blk=%zu | ENF:%s | %s | %s%s | e:enf X:clr space q ",
             (unsigned long long)tr_->ev_count(), ema_rate,
             (unsigned long long)tr_->kills_issued(),
+            (unsigned long long)tr_->denies(),
             (unsigned long long)tr_->hooks_failed(),
-            snap.watch_count, snap.frozen_count, armed, new_only ? "NEW" : "ALL",
+            snap.watch_count, snap.frozen_count, tr_->blocks_active(),
+            tr_->enforcement_on() ? "on" : "OFF",
+            armed, new_only ? "NEW" : "ALL",
             paused ? " [PAUSED]" : "");
         Color barcol = modal_up ? Color::Red : (paused ? Color::Magenta : Color::Blue);
 
@@ -316,6 +326,9 @@ void Ui::run() {
             }
             if (e == Event::Character('n') || e == Event::Character('N')) {
                 tr_->resolve_prompt(active.uid, active.pgid, 'n'); modal_up = false; return true;
+            }
+            if (e == Event::Character('b') || e == Event::Character('B')) {
+                tr_->resolve_prompt(active.uid, active.pgid, 'b'); modal_up = false; return true;
             }
             if (e == Event::Character('k') || e == Event::Character('K')) {
                 tr_->resolve_prompt(active.uid, active.pgid, 'k'); modal_up = false; return true;
@@ -350,6 +363,8 @@ void Ui::run() {
         if (e == Event::Character('n')) { new_only = true; sel = 0; return true; }
         if (e == Event::Character('a')) { new_only = false; sel = 0; return true; }
         if (e == Event::Character('0')) { hoff_l = 0; hoff_r = 0; return true; }
+        if (e == Event::Character('e')) { tr_->set_enforcement(!tr_->enforcement_on()); return true; }
+        if (e == Event::Character('X')) { tr_->flush_blocks(); return true; }
 
         if (e.is_mouse()) {
             auto m = e.mouse();

@@ -9,6 +9,11 @@ char LICENSE[] SEC("license") = "GPL";
 
 #define PR_SET_NAME 15
 #define AF_INET 2
+#define AF_INET6 10
+
+#ifndef EPERM
+#define EPERM 1
+#endif
 
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -30,6 +35,29 @@ struct {
     __type(key, __u32);
     __type(value, struct str_scratch);
 } str_buf SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 4096);
+    __type(key, __u32);
+    __type(value, struct blk_val);
+} blocked_tgids SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} enforce_on SEC(".maps");
+
+volatile const __u8  deny_exec         = 1;
+volatile const __u8  deny_wx           = 1;
+volatile const __u8  deny_setuid       = 1;
+volatile const __u8  deny_ptrace       = 1;
+volatile const __u8  deny_connect      = 1;
+volatile const __u8  block_descendants = 1;
+volatile const __u8  emit_deny_events  = 1;
+volatile const __u32 self_tgid         = 0;
 
 static __always_inline __u32 rd_pgid(struct task_struct *t) {
     if (!t) return 0;
@@ -246,4 +274,104 @@ int kp_tcp_conn(struct pt_regs *ctx) {
     e->data.net.dport = (dp << 8) | (dp >> 8);
     bpf_ringbuf_submit(e, 0);
     return 0;
+}
+
+static __always_inline int enforcement_live(void) {
+    __u32 z = 0;
+    __u32 *v = bpf_map_lookup_elem(&enforce_on, &z);
+    return v && *v;
+}
+
+static __always_inline int is_blocked(void) {
+    __u64 pt = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pt >> 32);
+    if (tgid == self_tgid) return 0;
+    if (bpf_map_lookup_elem(&blocked_tgids, &tgid)) return 1;
+    if (!block_descendants) return 0;
+    struct task_struct *t = bpf_get_current_task_btf();
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (!t) break;
+        t = BPF_CORE_READ(t, real_parent);
+        if (!t) break;
+        __u32 ptg = BPF_CORE_READ(t, tgid);
+        if (ptg == 0 || ptg == 1) break;
+        if (ptg == self_tgid) return 0;
+        if (bpf_map_lookup_elem(&blocked_tgids, &ptg)) return 1;
+    }
+    return 0;
+}
+
+static __always_inline void emit_deny(__u8 klass) {
+    if (!emit_deny_events) return;
+    struct edr_event *e = ev_reserve(EV_LSM_DENY);
+    if (!e) return;
+    fill_meta(e);
+    e->data.deny.klass = klass;
+    bpf_ringbuf_submit(e, 0);
+}
+
+SEC("lsm/bprm_check_security")
+int BPF_PROG(lsm_bprm, struct linux_binprm *bprm, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_exec || !enforcement_live()) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_EXEC);
+    return -EPERM;
+}
+
+SEC("lsm/file_mprotect")
+int BPF_PROG(lsm_mprotect, struct vm_area_struct *vma,
+             unsigned long reqprot, unsigned long prot, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_wx || !enforcement_live()) return 0;
+    if (!((prot & 0x2) && (prot & 0x4))) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_WX);
+    return -EPERM;
+}
+
+SEC("lsm/mmap_file")
+int BPF_PROG(lsm_mmap, struct file *file, unsigned long reqprot,
+             unsigned long prot, unsigned long flags, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_wx || !enforcement_live()) return 0;
+    if (!((prot & 0x2) && (prot & 0x4))) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_WX);
+    return -EPERM;
+}
+
+SEC("lsm/task_fix_setuid")
+int BPF_PROG(lsm_setuid, struct cred *new, const struct cred *old,
+             int flags, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_setuid || !enforcement_live()) return 0;
+    __u32 nu = BPF_CORE_READ(new, uid.val);
+    __u32 ou = BPF_CORE_READ(old, uid.val);
+    if (!(nu == 0 && ou != 0)) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_SETUID);
+    return -EPERM;
+}
+
+SEC("lsm/ptrace_access_check")
+int BPF_PROG(lsm_ptrace, struct task_struct *child, unsigned int mode, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_ptrace || !enforcement_live()) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_PTRACE);
+    return -EPERM;
+}
+
+SEC("lsm/socket_connect")
+int BPF_PROG(lsm_connect, struct socket *sock, struct sockaddr *address,
+             int addrlen, int ret) {
+    if (ret != 0) return ret;
+    if (!deny_connect || !enforcement_live()) return 0;
+    __u16 fam = BPF_CORE_READ(address, sa_family);
+    if (fam != AF_INET && fam != AF_INET6) return 0;
+    if (!is_blocked()) return 0;
+    emit_deny(DK_CONNECT);
+    return -EPERM;
 }

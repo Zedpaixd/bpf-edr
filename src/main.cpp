@@ -87,6 +87,16 @@ int main(int argc, char **argv) {
 
     struct edr_bpf *sk = edr_bpf__open();
     if (!sk) { std::fprintf(stderr, "skel open fail\n"); return 1; }
+
+    sk->rodata->deny_exec         = cfg_opt->deny_exec ? 1 : 0;
+    sk->rodata->deny_wx           = cfg_opt->deny_wx ? 1 : 0;
+    sk->rodata->deny_setuid       = cfg_opt->deny_setuid ? 1 : 0;
+    sk->rodata->deny_ptrace       = cfg_opt->deny_ptrace ? 1 : 0;
+    sk->rodata->deny_connect      = cfg_opt->deny_connect ? 1 : 0;
+    sk->rodata->block_descendants = cfg_opt->block_descendants ? 1 : 0;
+    sk->rodata->emit_deny_events  = cfg_opt->emit_deny_events ? 1 : 0;
+    sk->rodata->self_tgid         = opid;
+
     if (edr_bpf__load(sk)) {
         std::fprintf(stderr, "skel load fail (errno=%d %s)\n", errno, std::strerror(errno));
         edr_bpf__destroy(sk);
@@ -104,6 +114,16 @@ int main(int argc, char **argv) {
     try_attach(sk->progs.kp_commit_creds, tr.get(), "kprobe/commit_creds");
     try_attach(sk->progs.kp_sec_bpf, tr.get(), "kprobe/security_bpf");
     try_attach(sk->progs.kp_tcp_conn, tr.get(), "kprobe/tcp_v4_connect");
+    try_attach(sk->progs.lsm_bprm, tr.get(), "lsm/bprm_check_security");
+    try_attach(sk->progs.lsm_mprotect, tr.get(), "lsm/file_mprotect");
+    try_attach(sk->progs.lsm_mmap, tr.get(), "lsm/mmap_file");
+    try_attach(sk->progs.lsm_setuid, tr.get(), "lsm/task_fix_setuid");
+    try_attach(sk->progs.lsm_ptrace, tr.get(), "lsm/ptrace_access_check");
+    try_attach(sk->progs.lsm_connect, tr.get(), "lsm/socket_connect");
+
+    tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids),
+                            bpf_map__fd(sk->maps.enforce_on));
+    tr->set_enforcement(cfg_opt->enforce_enabled);
 
     struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(sk->maps.rb), rb_cb, tr.get(), nullptr);
     if (!rb) {
