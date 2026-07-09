@@ -48,10 +48,13 @@ struct EngineCfg {
     std::vector<std::string> exempt_comms;
     bool prompt_enabled = false;
     double prompt_threshold = 0.70;
+    double prompt_event_floor = 1.0;
     bool auto_kill_enabled = false;
-    std::string allow_action = "none";
+    std::string allow_action = "resume";
     std::string deny_action = "freeze";
-    std::string kill_action = "kill";};
+    std::string kill_action = "kill";
+    std::string whitelist_action = "whitelist";
+};
 
 class MathEng {
 public:

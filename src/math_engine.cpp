@@ -81,10 +81,12 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
         auto &p = j["prompt_config"];
         if (p.contains("enabled")) c.prompt_enabled = p["enabled"].get<bool>();
         if (p.contains("prompt_threshold")) c.prompt_threshold = p["prompt_threshold"].get<double>();
+        if (p.contains("prompt_event_floor")) c.prompt_event_floor = p["prompt_event_floor"].get<double>();
         if (p.contains("auto_kill_enabled")) c.auto_kill_enabled = p["auto_kill_enabled"].get<bool>();
         if (p.contains("allow_action")) c.allow_action = p["allow_action"].get<std::string>();
         if (p.contains("deny_action")) c.deny_action = p["deny_action"].get<std::string>();
         if (p.contains("kill_action")) c.kill_action = p["kill_action"].get<std::string>();
+        if (p.contains("whitelist_action")) c.whitelist_action = p["whitelist_action"].get<std::string>();
     }
     return c;
 }

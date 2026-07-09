@@ -10,7 +10,6 @@ CMakeSecondaryUnsupported.txt
 cmake_install.cmake
 CPackConfig.cmake
 CPackSourceConfig.cmake
-Makefile
 progress.marks
 /include/edr.skel.h
 /include/vmlinux.h

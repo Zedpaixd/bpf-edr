@@ -25,6 +25,7 @@ struct FlatRow {
     bool is_new;
     bool is_anchor;
     bool exempt;
+    bool frozen;
 };
 
 Ui::Ui(std::shared_ptr<Tracker> t) : tr_(std::move(t)) {}
@@ -50,13 +51,13 @@ static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
                           bool anchor_used, std::vector<FlatRow> &out) {
     if (!n.exempt) {
         out.push_back({depth, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, n.is_new, false, false});
+                       n.is_dead, n.is_new, false, false, n.frozen});
         for (auto &c : n.children) collapse_walk(c, depth + 1, false, anchor_used, out);
     } else {
         bool anchor = (!anchor_used && !parent_exempt);
         if (anchor) {
             out.push_back({depth, n.pid, n.comm, n.risk_pct, 0.0,
-                           n.is_dead, n.is_new, true, true});
+                           n.is_dead, n.is_new, true, true, false});
             for (auto &c : n.children) collapse_walk(c, depth + 1, true, true, out);
         } else {
             for (auto &c : n.children) collapse_walk(c, depth, true, anchor_used, out);
@@ -67,7 +68,7 @@ static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
 static void newonly_walk(const SnapNode &n, std::vector<FlatRow> &out) {
     if (n.is_new && !n.exempt)
         out.push_back({0, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, true, false, false});
+                       n.is_dead, true, false, false, n.frozen});
     for (auto &c : n.children) newonly_walk(c, out);
 }
 
@@ -83,16 +84,20 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
     prefix += r.is_new ? "* " : "  ";
     std::string label = prefix + "[" + std::to_string(r.pid) + "] " + r.comm
                         + " - " + fmt_pct(r.risk_pct);
-    if (r.is_dead) label += " (dead)";
+    if (r.frozen) label += " (FROZEN)";
+    else if (r.is_dead) label += " (dead)";
     if (r.is_anchor) label += "  <shell>";
     Color c;
-    if (r.is_dead)        c = r.risk_pct >= 0.20 ? Color::Red : Color::GrayDark;
+    if (r.frozen)         c = Color::Cyan;
+    else if (r.is_dead)   c = r.risk_pct >= 0.20 ? Color::Red : Color::GrayDark;
     else if (r.is_anchor) c = Color::GrayDark;
     else if (r.exempt)    c = Color::GrayLight;
     else                  c = risk_color(r.risk_pct);
 
     Elements parts;
-    parts.push_back(text(hclip(label, hoff)) | color(c));
+    Element base = text(hclip(label, hoff)) | color(c);
+    if (r.frozen) base = base | bold;
+    parts.push_back(base);
     if (r.badge_risk > 0.05) {
         std::string chip = " sub " + fmt_pct(r.badge_risk) + " ";
         Element ce = text(chip) | bgcolor(risk_color(r.badge_risk)) | color(Color::Black) | bold;
@@ -117,9 +122,9 @@ static Element build_tree_pane(const Snapshot &snap, int &sel, bool new_only, in
     for (int i = 0; i < (int)rows.size(); i++) list.push_back(make_row(rows[i], i == sel, hoff));
     char meta[224];
     std::snprintf(meta, sizeof(meta),
-        " %s | row %d/%zu | live=%zu new=%zu total=%zu | sub=child-danger | H%+d ",
+        " %s | row %d/%zu | live=%zu new=%zu frozen=%zu | H%+d ",
         new_only ? "NEW ONLY (a: all)" : "ALL (n: new only)",
-        sel + 1, rows.size(), snap.live_nodes, snap.new_nodes, snap.total_nodes, hoff);
+        sel + 1, rows.size(), snap.live_nodes, snap.new_nodes, snap.frozen_count, hoff);
     return window(text(" Lineage & State ") | bold,
                   vbox({ text(meta) | dim, separator(),
                          vbox(std::move(list)) | vscroll_indicator | yframe | flex }));
@@ -193,7 +198,8 @@ static Element build_audit_pane(const std::vector<std::string> &lines, int hoff,
         for (auto &s : lines) {
             Color c = Color::Yellow;
             if (s.find("KILL") != std::string::npos) c = Color::Red;
-            else if (s.find("FREEZE") != std::string::npos) c = Color::Magenta;
+            else if (s.find("FREEZE") != std::string::npos) c = Color::Cyan;
+            else if (s.find("RESUME") != std::string::npos) c = Color::Green;
             else if (s.find("WHITELIST") != std::string::npos) c = Color::Green;
             else if (s.find("MASQUERADE") != std::string::npos) c = Color::Magenta;
             else if (s.find("[hook]") != std::string::npos) c = Color::Cyan;
@@ -206,25 +212,28 @@ static Element build_audit_pane(const std::vector<std::string> &lines, int hoff,
 }
 
 static Element build_modal(const PromptReq &p) {
+    std::string org = (p.origin == p.comm) ? std::string() : ("  (from: " + p.origin + ")");
     Elements v;
-    v.push_back(text("  *** HIGH-CONFIDENCE THREAT ***  ") | bold | color(Color::Black) | bgcolor(Color::Red) | center);
+    v.push_back(text("  THREAT FROZEN - AWAITING DECISION  ") | bold | color(Color::Black) | bgcolor(Color::Red) | center);
     v.push_back(text(""));
     char l1[256];
-    std::snprintf(l1, sizeof(l1), "  Process : [%u] %s", p.pid, p.comm.c_str());
+    std::snprintf(l1, sizeof(l1), "  Process : [%u] %s%s", p.pid, p.comm.c_str(), org.c_str());
     v.push_back(text(l1) | bold);
     char l2[64];
     std::snprintf(l2, sizeof(l2), "  Risk    : %.1f%%", p.risk * 100.0);
     v.push_back(text(l2) | color(Color::Red) | bold);
-    v.push_back(text("  Trying  : " + p.doing) | color(Color::Yellow));
+    v.push_back(text("  Flagged : it tried to " + p.doing) | color(Color::Yellow));
+    v.push_back(text("            (this action ran; process now suspended before the next)") | dim);
     v.push_back(text(""));
     v.push_back(separator());
     v.push_back(text("  [Y] allow -> " + p.allow_lbl) | color(Color::Green));
     v.push_back(text("  [N] deny  -> " + p.deny_lbl) | color(Color::Yellow));
     v.push_back(text("  [K] kill  -> " + p.kill_lbl) | color(Color::Red));
-    v.push_back(text("  [Esc] dismiss (no action) ") | dim);
+    v.push_back(text("  [W] w-list-> " + p.wl_lbl) | color(Color::Cyan));
+    v.push_back(text("  [Esc] dismiss (leave suspended, no action) ") | dim);
     return window(text(" THREAT CONFIRMATION ") | bold | color(Color::Red),
                   vbox(std::move(v)))
-           | size(WIDTH, EQUAL, 74) | bgcolor(Color::Black) | clear_under;
+           | size(WIDTH, EQUAL, 78) | bgcolor(Color::Black) | clear_under;
 }
 
 void Ui::run() {
@@ -243,13 +252,13 @@ void Ui::run() {
     double prev_t = 0.0, ema_rate = 0.0;
 
     auto renderer = Renderer([&]() {
-        if (!modal_up && !paused && tr_->prompts_enabled()) {
+        if (!modal_up && tr_->prompts_enabled()) {
             auto p = tr_->take_prompt();
             if (p) { active = *p; modal_up = true; }
         }
 
-        Snapshot snap = paused ? fsnap : tr_->snapshot();
-        std::vector<std::string> all = paused ? falerts : tr_->tail_alerts(999);
+        Snapshot snap = (paused && !modal_up) ? fsnap : tr_->snapshot();
+        std::vector<std::string> all = (paused && !modal_up) ? falerts : tr_->tail_alerts(999);
 
         {
             using namespace std::chrono;
@@ -277,11 +286,11 @@ void Ui::run() {
 
         char status[300];
         std::snprintf(status, sizeof(status),
-            " EDR | ev=%llu %.0f/s | kills=%llu hookfail=%llu | watch=%zu | %s | %s%s | wheel 0 n/a space q ",
+            " EDR | ev=%llu %.0f/s | kills=%llu hookfail=%llu | watch=%zu frozen=%zu | %s | %s%s | wheel 0 n/a space q ",
             (unsigned long long)tr_->ev_count(), ema_rate,
             (unsigned long long)tr_->kills_issued(),
             (unsigned long long)tr_->hooks_failed(),
-            snap.watch_count, armed, new_only ? "NEW" : "ALL",
+            snap.watch_count, snap.frozen_count, armed, new_only ? "NEW" : "ALL",
             paused ? " [PAUSED]" : "");
         Color barcol = modal_up ? Color::Red : (paused ? Color::Magenta : Color::Blue);
 
@@ -291,27 +300,32 @@ void Ui::run() {
             build_masq_pane(snap, hoff_r)        | size(HEIGHT, EQUAL, 11),
             build_audit_pane(awin, hoff_r, roff) | flex
         });
-        Element base = vbox({
+        Element bview = vbox({
             text(status) | bold | bgcolor(barcol),
             hbox({ build_tree_pane(snap, sel, new_only, hoff_l) | flex_grow,
                    right | size(WIDTH, EQUAL, 62) }) | flex
         });
-        if (modal_up) return dbox({ base | dim, build_modal(active) | center });
-        return base;
+        if (modal_up) return dbox({ bview | dim, build_modal(active) | center });
+        return bview;
     });
 
     auto with_keys = CatchEvent(renderer, [&](Event e) {
         if (modal_up) {
             if (e == Event::Character('y') || e == Event::Character('Y')) {
-                tr_->resolve_prompt(active.uid, 'y'); modal_up = false; return true;
+                tr_->resolve_prompt(active.uid, active.pgid, 'y'); modal_up = false; return true;
             }
             if (e == Event::Character('n') || e == Event::Character('N')) {
-                tr_->resolve_prompt(active.uid, 'n'); modal_up = false; return true;
+                tr_->resolve_prompt(active.uid, active.pgid, 'n'); modal_up = false; return true;
             }
             if (e == Event::Character('k') || e == Event::Character('K')) {
-                tr_->resolve_prompt(active.uid, 'k'); modal_up = false; return true;
+                tr_->resolve_prompt(active.uid, active.pgid, 'k'); modal_up = false; return true;
             }
-            if (e == Event::Escape) { modal_up = false; return true; }
+            if (e == Event::Character('w') || e == Event::Character('W')) {
+                tr_->resolve_prompt(active.uid, active.pgid, 'w'); modal_up = false; return true;
+            }
+            if (e == Event::Escape) {
+                tr_->resolve_prompt(active.uid, active.pgid, 'x'); modal_up = false; return true;
+            }
             return true;
         }
 
@@ -357,7 +371,7 @@ void Ui::run() {
 
     std::thread refresh([&]() {
         while (!stop_.load() && tr_->running()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
             screen.PostEvent(Event::Custom);
         }
     });

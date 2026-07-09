@@ -19,11 +19,13 @@
     "prompt_config": {
         "enabled": true,
         "prompt_threshold": 0.70,
+        "prompt_event_floor": 1.0,
         "auto_kill_enabled": false,
-        "allow_action": "none",
+        "allow_action": "resume",
         "deny_action": "freeze",
         "kill_action": "kill",
-        "_action_options": "none | whitelist | freeze | kill"
+        "whitelist_action": "whitelist",
+        "_action_options": "none | resume | freeze | kill | whitelist"
     },
     "categories": {
         "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },

@@ -38,7 +38,8 @@ struct ProcNode {
     bool   is_new = false;
     bool   exempt = false;
     bool   kill_flagged = false;
-    bool   prompt_armed = true;
+    bool   frozen = false;
+    bool   prompt_pending = false;
     std::weak_ptr<ProcNode> parent;
     std::vector<std::shared_ptr<ProcNode>> children;
 };
@@ -51,6 +52,7 @@ struct SnapNode {
     bool          is_dead = false;
     bool          is_new = false;
     bool          exempt = false;
+    bool          frozen = false;
     std::vector<SnapNode> children;
 };
 
@@ -88,11 +90,13 @@ struct PromptReq {
     std::uint32_t pid = 0;
     std::uint32_t pgid = 0;
     std::string   comm;
+    std::string   origin;
     std::string   doing;
     double        risk = 0.0;
     std::string   allow_lbl;
     std::string   deny_lbl;
     std::string   kill_lbl;
+    std::string   wl_lbl;
 };
 
 struct Snapshot {
@@ -104,6 +108,7 @@ struct Snapshot {
     std::size_t live_nodes = 0;
     std::size_t new_nodes = 0;
     std::size_t watch_count = 0;
+    std::size_t frozen_count = 0;
 };
 
 class Tracker {
@@ -124,7 +129,7 @@ public:
     double warmup_remaining() const;
     bool prompts_enabled() const { return cfg_.prompt_enabled; }
     std::optional<PromptReq> take_prompt();
-    void resolve_prompt(const std::string &uid, char decision);
+    void resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision);
 
 private:
     EngineCfg cfg_;
@@ -163,9 +168,8 @@ private:
     std::shared_ptr<ProcNode> responsible_launcher(const std::shared_ptr<ProcNode> &src);
     void recompute_badges();
     std::string active_stages(const std::shared_ptr<ProcNode> &n) const;
-    std::string describe_stages(const std::shared_ptr<ProcNode> &n) const;
     std::string compute_origin(const std::shared_ptr<ProcNode> &n) const;
-    void enqueue_prompt(const std::shared_ptr<ProcNode> &n);
+    void enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action);
     void update_watchlist(const std::shared_ptr<ProcNode> &n);
     void log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new_name, bool susp);
     void log_alert(const std::string &s);

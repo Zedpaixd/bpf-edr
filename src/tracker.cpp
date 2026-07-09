@@ -1,6 +1,7 @@
 #include "tracker.h"
 #include <algorithm>
 #include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,13 +16,14 @@ static constexpr double WATCH_THRESHOLD = 0.40;
 static constexpr std::size_t WATCH_MAX = 20;
 static constexpr std::size_t MASQ_CAP = 100;
 
-enum PromptAct { PA_NONE = 0, PA_WHITELIST, PA_FREEZE, PA_KILL };
+enum PromptAct { PA_NONE = 0, PA_RESUME, PA_FREEZE, PA_KILL, PA_WHITELIST };
 
 static const struct { const char *name; const char *desc; } PROMPT_ACTIONS[] = {
-    { "none",      "no action; let the process keep running" },
-    { "whitelist", "allow this session; stop scoring & prompting" },
-    { "freeze",    "SIGSTOP the process group (suspend, reversible)" },
-    { "kill",      "SIGKILL the process group (terminate)" },
+    { "none",      "take no action; leave the process as-is" },
+    { "resume",    "resume execution (SIGCONT)" },
+    { "freeze",    "keep suspended, blocking further activity (SIGSTOP)" },
+    { "kill",      "terminate the process group (SIGKILL)" },
+    { "whitelist", "allow for this session; resume & stop scoring" },
 };
 
 static int act_index(const std::string &s) {
@@ -30,6 +32,21 @@ static int act_index(const std::string &s) {
     return PA_NONE;
 }
 static const char *act_desc(const std::string &s) { return PROMPT_ACTIONS[act_index(s)].desc; }
+
+static std::string ev_action_desc(std::uint8_t t) {
+    switch (t) {
+        case EV_EXEC: return "execute a new binary (execve)";
+        case EV_MEMFD_CREATE: return "create an in-memory file (memfd_create; fileless exec)";
+        case EV_MPROTECT_WX: return "make memory writable+executable (mprotect W^X; injection)";
+        case EV_PTRACE: return "attach to another process (ptrace; memory tampering)";
+        case EV_COMMIT_CREDS: return "escalate privileges to root (commit_creds)";
+        case EV_UNSHARE: return "create a new namespace (unshare; isolation/escape)";
+        case EV_PRCTL_RENAME: return "disguise its process name (prctl PR_SET_NAME)";
+        case EV_SEC_BPF: return "load an eBPF program (bpf syscall)";
+        case EV_TCP_CONNECT: return "open an outbound connection (possible C2)";
+    }
+    return "perform a suspicious operation";
+}
 
 static double now_sec() {
     using namespace std::chrono;
@@ -337,24 +354,6 @@ std::string Tracker::active_stages(const std::shared_ptr<ProcNode> &n) const {
     return s;
 }
 
-std::string Tracker::describe_stages(const std::shared_ptr<ProcNode> &n) const {
-    static const struct { char c; const char *phrase; } M[] = {
-        {'X', "fileless/in-memory exec"}, {'M', "W^X memory / injection"},
-        {'P', "privilege/namespace escalation"}, {'E', "masquerade / BPF tamper"},
-        {'C', "outbound network (C2?)"}, {'L', "rapid process spawning"},
-    };
-    std::string st = active_stages(n);
-    std::string out;
-    for (auto &m : M) {
-        if (st.find(m.c) != std::string::npos) {
-            if (!out.empty()) out += " + ";
-            out += m.phrase;
-        }
-    }
-    if (out.empty()) out = "suspicious syscall activity";
-    return out;
-}
-
 std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
     std::string origin(n->comm, ::strnlen(n->comm, MAX_COMM));
     auto cur = n->parent.lock();
@@ -366,15 +365,17 @@ std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
     return origin;
 }
 
-void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n) {
+void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action) {
     PromptReq r;
     r.uid = n->uid; r.pid = n->pid; r.pgid = n->pgid;
     r.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
-    r.doing = describe_stages(n);
+    r.origin = compute_origin(n);
+    r.doing = action;
     r.risk = n->risk_pct;
     r.allow_lbl = act_desc(cfg_.allow_action);
     r.deny_lbl = act_desc(cfg_.deny_action);
     r.kill_lbl = act_desc(cfg_.kill_action);
+    r.wl_lbl = act_desc(cfg_.whitelist_action);
     std::lock_guard<std::mutex> lk(prompt_mtx_);
     if (prompt_q_.size() < 32) prompt_q_.push_back(std::move(r));
 }
@@ -387,34 +388,52 @@ std::optional<PromptReq> Tracker::take_prompt() {
     return r;
 }
 
-void Tracker::resolve_prompt(const std::string &uid, char decision) {
-    std::string action = (decision == 'y') ? cfg_.allow_action
-                       : (decision == 'n') ? cfg_.deny_action
-                                           : cfg_.kill_action;
+void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision) {
+    std::string action; const char *dn;
+    switch (decision) {
+        case 'y': action = cfg_.allow_action; dn = "ALLOW"; break;
+        case 'n': action = cfg_.deny_action; dn = "DENY"; break;
+        case 'k': action = cfg_.kill_action; dn = "KILL"; break;
+        case 'w': action = cfg_.whitelist_action; dn = "WHITELIST"; break;
+        default:  action = "none"; dn = "DISMISS"; break;
+    }
     int a = act_index(action);
-    std::uint32_t pgid = 0; std::string comm;
+    std::string comm;
     {
         std::unique_lock<std::shared_mutex> lk(g_lock_);
         auto it = nodes_.find(uid);
         if (it != nodes_.end() && it->second) {
-            pgid = it->second->pgid;
-            comm.assign(it->second->comm, ::strnlen(it->second->comm, MAX_COMM));
-            if (a == PA_WHITELIST) it->second->exempt = true;
+            auto &n = it->second;
+            comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+            if (pgid == 0) pgid = n->pgid;
+            n->prompt_pending = false;
+            n->last_score_ts = now_sec();
+            if (a == PA_RESUME || a == PA_WHITELIST) n->frozen = false;
+            if (a == PA_FREEZE) n->frozen = true;
+            if (a == PA_WHITELIST) n->exempt = true;
         }
     }
-    const char *dn = (decision == 'y') ? "ALLOW" : (decision == 'n') ? "DENY" : "KILL";
-    bool actionable = (pgid > 1 && pgid != own_pgid_);
-    if (a == PA_FREEZE && actionable) {
-        ::kill(-static_cast<pid_t>(pgid), SIGSTOP);
-        log_alert(std::string("[") + dn + "->FREEZE] pgid=" + std::to_string(pgid) + " " + comm + " suspended (SIGSTOP)");
-    } else if (a == PA_KILL && actionable) {
-        ::kill(-static_cast<pid_t>(pgid), SIGKILL);
-        kills_.fetch_add(1);
-        log_alert(std::string("[") + dn + "->KILL] pgid=" + std::to_string(pgid) + " " + comm + " terminated (SIGKILL)");
-    } else if (a == PA_WHITELIST) {
-        log_alert(std::string("[") + dn + "->WHITELIST] " + comm + " allowed for session");
-    } else {
-        log_alert(std::string("[") + dn + "->NONE] " + comm + " no action taken");
+    bool ok = (pgid > 1 && pgid != own_pgid_);
+    switch (a) {
+        case PA_RESUME:
+            if (ok) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+            log_alert(std::string("[") + dn + "->RESUME] " + comm + " resumed (SIGCONT)");
+            break;
+        case PA_FREEZE:
+            if (ok) ::kill(-static_cast<pid_t>(pgid), SIGSTOP);
+            log_alert(std::string("[") + dn + "->FREEZE] " + comm + " kept suspended (SIGSTOP)");
+            break;
+        case PA_KILL:
+            if (ok) { ::kill(-static_cast<pid_t>(pgid), SIGKILL); kills_.fetch_add(1); }
+            log_alert(std::string("[") + dn + "->KILL] " + comm + " terminated (SIGKILL)");
+            break;
+        case PA_WHITELIST:
+            if (ok) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+            log_alert(std::string("[") + dn + "->WHITELIST] " + comm + " whitelisted & resumed");
+            break;
+        default:
+            log_alert(std::string("[") + dn + "] " + comm + " no action taken");
+            break;
     }
 }
 
@@ -490,6 +509,7 @@ void Tracker::ingest(const edr_event &e) {
         return;
     } else {
         n = ensure_node(e);
+        if (n && e.pgid > 0) n->pgid = e.pgid;
         if (n && e.ev_type == EV_EXEC) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
             n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
@@ -501,7 +521,7 @@ void Tracker::ingest(const edr_event &e) {
             log_masquerade(n, nn, prctl_score);
         }
     }
-    if (!n || n->exempt) return;
+    if (!n || n->exempt || n->frozen) return;
 
     std::string k = ev_key(e.ev_type);
     if (e.ev_type == EV_PRCTL_RENAME && !prctl_score) return;
@@ -524,6 +544,24 @@ void Tracker::ingest(const edr_event &e) {
             active_stages(n).c_str());
         log_alert(msg);
     }
+
+    double tw = now_sec();
+    bool warm = (tw - start_ts_) >= cfg_.warmup_sec;
+    if (cfg_.prompt_enabled && warm && !n->prompt_pending
+        && base >= cfg_.prompt_event_floor
+        && n->risk_pct >= cfg_.prompt_threshold) {
+        std::uint32_t pg = n->pgid;
+        if (pg > 1 && pg != own_pgid_) {
+            ::kill(-static_cast<pid_t>(pg), SIGSTOP);
+            n->frozen = true;
+            n->prompt_pending = true;
+            enqueue_prompt(n, ev_action_desc(e.ev_type));
+            char fm[160];
+            std::snprintf(fm, sizeof(fm), "[FREEZE] pid=%u %s suspended at %.0f%% pending decision",
+                          n->pid, n->comm, n->risk_pct * 100.0);
+            log_alert(fm);
+        }
+    }
 }
 
 void Tracker::mitigate(std::shared_ptr<ProcNode> n) {
@@ -543,10 +581,6 @@ void Tracker::mitigate(std::shared_ptr<ProcNode> n) {
             n->is_dead = true; n->died_ts = now_sec();
             auto wit = watchlist_.find(n->uid);
             if (wit != watchlist_.end()) wit->second.is_dead = true;
-        } else {
-            char msg[160];
-            std::snprintf(msg, sizeof(msg), "[AUTO-KILL] pgid=%u FAILED errno=%d", pgid, errno);
-            log_alert(msg);
         }
     } else {
         char msg[192];
@@ -602,24 +636,16 @@ void Tracker::tick() {
         std::unique_lock<std::shared_mutex> lk(g_lock_);
         for (auto &kv : nodes_) {
             auto &n = kv.second;
-            if (!n || n->exempt) continue;
+            if (!n || n->exempt || n->frozen) continue;
             decay_to(n, t);
             recompute(n);
         }
         recompute_badges();
         for (auto &kv : nodes_) {
             auto &n = kv.second;
-            if (!n || n->exempt) continue;
+            if (!n || n->exempt || n->frozen) continue;
             if (!n->is_dead) update_watchlist(n);
             if (n->is_dead) continue;
-            if (cfg_.prompt_enabled) {
-                if (n->risk_pct >= cfg_.prompt_threshold && n->prompt_armed) {
-                    n->prompt_armed = false;
-                    enqueue_prompt(n);
-                } else if (n->risk_pct < cfg_.prompt_threshold - 0.10) {
-                    n->prompt_armed = true;
-                }
-            }
             if (n->risk_pct >= cfg_.kill_threshold) {
                 if (n->above_since <= 0.0) n->above_since = t;
                 if (warm && (t - n->above_since) >= cfg_.dwell_sec)
@@ -642,6 +668,7 @@ SnapNode Tracker::build_snap(const std::shared_ptr<ProcNode> &n) const {
     s.is_dead = n->is_dead;
     s.is_new = n->is_new;
     s.exempt = n->exempt;
+    s.frozen = n->frozen;
     for (auto &c : n->children) if (c) s.children.push_back(build_snap(c));
     return s;
 }
@@ -674,6 +701,7 @@ Snapshot Tracker::snapshot() const {
         if (!kv.second) continue;
         if (!kv.second->is_dead) s.live_nodes++;
         if (kv.second->is_new && !kv.second->is_dead && !kv.second->exempt) s.new_nodes++;
+        if (kv.second->frozen) s.frozen_count++;
     }
     std::size_t mn = std::min<std::size_t>(8, masq_events_.size());
     for (std::size_t i = masq_events_.size() - mn; i < masq_events_.size(); i++)
