@@ -10,6 +10,7 @@
 #define MAX_ARG_LEN 256
 #define MAX_COMM 16
 #define MAX_NAME 64
+#define BURST_FP_SCALE 65536
 
 enum edr_ev_type {
     EV_FORK          = 1,
@@ -23,7 +24,8 @@ enum edr_ev_type {
     EV_UNSHARE       = 9,
     EV_SEC_BPF       = 10,
     EV_TCP_CONNECT   = 11,
-    EV_LSM_DENY      = 12
+    EV_LSM_DENY      = 12,
+    EV_BURST_TRIP    = 13
 };
 
 enum edr_deny_klass {
@@ -45,6 +47,12 @@ struct blk_val {
     __u64 armed_ns;
     __u8  mode;
     __u8  _pad[7];
+} __attribute__((aligned(8)));
+
+struct burst_val {
+    __u64 sum_fp;
+    __u32 epoch;
+    __u32 _pad;
 } __attribute__((aligned(8)));
 
 struct edr_event {
@@ -69,6 +77,7 @@ struct edr_event {
         struct { __u32 flags; __u32 _p; } unshare_ev;
         struct { __u32 daddr; __u16 dport; __u16 _p; __u32 saddr; } net;
         struct { __u8 klass; __u8 _p[7]; } deny;
+        struct { __u32 weight_fp; __u32 _p; } burst;
         __u8  _raw[MAX_ARG_LEN];
     } data __attribute__((aligned(8)));
 } __attribute__((aligned(8)));

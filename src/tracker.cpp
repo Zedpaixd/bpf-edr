@@ -83,6 +83,7 @@ static int ev_category(std::uint8_t t) {
 Tracker::Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid)
     : cfg_(std::move(cfg)), own_pgid_(own_pgid), own_pid_(own_pid) {
     start_ts_ = now_sec();
+    last_epoch_bump_ = start_ts_;
     if (cfg_.exempt_comms.empty()) {
         cfg_.exempt_comms = { "bash", "sh", "dash", "zsh", "fish", "ksh", "ash",
                               "python", "python3", "perl", "ruby", "node", "env",
@@ -136,6 +137,16 @@ bool Tracker::is_masq_name(const char *nm) const {
     return false;
 }
 
+void Tracker::kernel_exempt(std::uint32_t tgid, bool on) {
+    if (exempt_fd_ < 0 || tgid == 0) return;
+    if (on) {
+        std::uint8_t v = 1;
+        bpf_map_update_elem(exempt_fd_, &tgid, &v, BPF_ANY);
+    } else {
+        bpf_map_delete_elem(exempt_fd_, &tgid);
+    }
+}
+
 void Tracker::log_alert(const std::string &s) {
     std::lock_guard<std::mutex> lk(alert_lock_);
     alerts_.push_back("[" + now_hms_ms() + "] " + s);
@@ -187,6 +198,7 @@ void Tracker::seed_from_proc() {
         std::memcpy(n->comm, se.comm.data(), clen);
         n->comm[clen] = 0;
         n->exempt = self_pid(se.pid, se.pgid) || is_exempt_comm(n->comm);
+        if (n->exempt) kernel_exempt(se.pid, true);
         n->created_ts = t; n->last_ev_ts = t; n->last_score_ts = t;
         nodes_[n->uid] = n;
         pid_to_uid_[se.pid] = n->uid;
@@ -231,6 +243,7 @@ std::shared_ptr<ProcNode> Tracker::fork_node(const edr_event &e) {
     n->is_new = true;
     std::memcpy(n->comm, e.comm, MAX_COMM);
     n->exempt = self_pid(e.pid, e.pgid) || is_exempt_comm(n->comm);
+    if (n->exempt) kernel_exempt(n->tgid, true);
     double t = ns_to_sec(e.ts_ns);
     n->created_ts = t; n->last_ev_ts = t; n->last_score_ts = t;
     auto par = lookup_by_pid(e.ppid);
@@ -251,6 +264,7 @@ std::shared_ptr<ProcNode> Tracker::ensure_node(const edr_event &e) {
     sn->is_new = false;
     std::memcpy(sn->comm, e.comm, MAX_COMM);
     sn->exempt = self_pid(e.pid, e.pgid) || is_exempt_comm(sn->comm);
+    if (sn->exempt) kernel_exempt(sn->tgid, true);
     double t = ns_to_sec(e.ts_ns);
     sn->created_ts = t; sn->last_ev_ts = t; sn->last_score_ts = t;
     auto par = lookup_by_pid(e.ppid);
@@ -407,6 +421,11 @@ void Tracker::set_enforcement_fds(int block_fd, int switch_fd) {
     enforce_switch_fd_ = switch_fd;
 }
 
+void Tracker::set_burst_fds(int epoch_fd, int exempt_fd) {
+    burst_epoch_fd_ = epoch_fd;
+    exempt_fd_ = exempt_fd;
+}
+
 void Tracker::set_enforcement(bool on) {
     enforce_on_.store(on);
     if (enforce_switch_fd_ >= 0) {
@@ -488,7 +507,7 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
             n->last_score_ts = now_sec();
             if (a == PA_RESUME || a == PA_WHITELIST) n->frozen = false;
             if (a == PA_FREEZE) n->frozen = true;
-            if (a == PA_WHITELIST) { n->exempt = true; n->blocked = false; }
+            if (a == PA_WHITELIST) { n->exempt = true; n->blocked = false; kernel_exempt(n->tgid, true); }
         }
     }
     if ((a == PA_WHITELIST || a == PA_KILL) && tgid != 0) disarm_block(tgid);
@@ -573,6 +592,20 @@ void Tracker::log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new
 void Tracker::ingest(const edr_event &e) {
     ev_count_.fetch_add(1);
 
+    if (e.ev_type == EV_BURST_TRIP) {
+        burst_trips_.fetch_add(1);
+        double w = (double)e.data.burst.weight_fp / (double)BURST_FP_SCALE;
+        char msg[192];
+        std::snprintf(msg, sizeof(msg),
+            "[BURST] pid=%u %s auto-blocked in-kernel (weight %.1f in window)",
+            e.pid, e.comm, w);
+        log_alert(msg);
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto n = lookup_by_pid(e.tgid);
+        if (n) n->blocked = true;
+        return;
+    }
+
     if (e.ev_type == EV_LSM_DENY) {
         denies_.fetch_add(1);
         const char *k = "syscall";
@@ -604,6 +637,7 @@ void Tracker::ingest(const edr_event &e) {
             auto wit = watchlist_.find(n->uid);
             if (wit != watchlist_.end()) wit->second.is_dead = true;
             if (n->blocked) { n->blocked = false; disarm_block(n->tgid); }
+            kernel_exempt(n->tgid, false);
         }
         return;
     } else {
@@ -612,6 +646,7 @@ void Tracker::ingest(const edr_event &e) {
         if (n && e.ev_type == EV_EXEC) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
             n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
+            kernel_exempt(n->tgid, n->exempt);
         }
         if (n && e.ev_type == EV_PRCTL_RENAME && !n->exempt) {
             char nn[MAX_COMM] = {0};
@@ -730,6 +765,17 @@ void Tracker::gc_sweep(double now_s) {
 void Tracker::tick() {
     double t = now_sec();
     bool warm = (t - start_ts_) >= cfg_.warmup_sec;
+
+    if (burst_epoch_fd_ >= 0 && cfg_.burst_window_ms > 0) {
+        double win_s = (double)cfg_.burst_window_ms / 1000.0;
+        if ((t - last_epoch_bump_) >= win_s) {
+            epoch_++;
+            std::uint32_t z = 0;
+            bpf_map_update_elem(burst_epoch_fd_, &z, &epoch_, BPF_ANY);
+            last_epoch_bump_ = t;
+        }
+    }
+
     std::vector<std::shared_ptr<ProcNode>> kill_list;
     {
         std::unique_lock<std::shared_mutex> lk(g_lock_);

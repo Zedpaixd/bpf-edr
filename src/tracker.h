@@ -133,10 +133,12 @@ public:
     std::optional<PromptReq> take_prompt();
     void resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision);
     void set_enforcement_fds(int block_fd, int switch_fd);
+    void set_burst_fds(int epoch_fd, int exempt_fd);
     void set_enforcement(bool on);
     void flush_blocks();
     bool enforcement_on() const { return enforce_on_.load(); }
     std::uint64_t denies() const { return denies_.load(); }
+    std::uint64_t burst_trips() const { return burst_trips_.load(); }
     std::size_t blocks_active() const;
 
 private:
@@ -160,8 +162,13 @@ private:
     std::atomic<std::uint64_t> ev_count_{0};
     int block_map_fd_ = -1;
     int enforce_switch_fd_ = -1;
+    int burst_epoch_fd_ = -1;
+    int exempt_fd_ = -1;
+    double last_epoch_bump_ = 0.0;
+    std::uint32_t epoch_ = 0;
     std::atomic<bool> enforce_on_{true};
     std::atomic<std::uint64_t> denies_{0};
+    std::atomic<std::uint64_t> burst_trips_{0};
 
     std::string mk_uid(std::uint32_t tgid, std::uint64_t ts_ns) const;
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
@@ -192,6 +199,7 @@ private:
     void detach_from_parent(const std::shared_ptr<ProcNode> &n);
     bool arm_block(std::uint32_t tgid);
     void disarm_block(std::uint32_t tgid);
+    void kernel_exempt(std::uint32_t tgid, bool on);
 };
 
 #endif

@@ -76,7 +76,6 @@ int main(int argc, char **argv) {
     std::uint32_t opgid = static_cast<std::uint32_t>(getpgid(0));
     std::uint32_t opid  = static_cast<std::uint32_t>(getpid());
     auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid);
-    tr->seed_from_proc();
     g_tr = tr.get();
 
     if (access("/sys/kernel/tracing/events/sched/sched_process_fork/id", F_OK) != 0) {
@@ -88,6 +87,7 @@ int main(int argc, char **argv) {
     struct edr_bpf *sk = edr_bpf__open();
     if (!sk) { std::fprintf(stderr, "skel open fail\n"); return 1; }
 
+    auto fp = [](double d) -> std::uint32_t { return (std::uint32_t)(d * (double)BURST_FP_SCALE); };
     sk->rodata->deny_exec         = cfg_opt->deny_exec ? 1 : 0;
     sk->rodata->deny_wx           = cfg_opt->deny_wx ? 1 : 0;
     sk->rodata->deny_setuid       = cfg_opt->deny_setuid ? 1 : 0;
@@ -96,6 +96,17 @@ int main(int argc, char **argv) {
     sk->rodata->block_descendants = cfg_opt->block_descendants ? 1 : 0;
     sk->rodata->emit_deny_events  = cfg_opt->emit_deny_events ? 1 : 0;
     sk->rodata->self_tgid         = opid;
+    sk->rodata->burst_enabled     = cfg_opt->burst_enabled ? 1 : 0;
+    sk->rodata->burst_ceiling_fp  = (std::uint64_t)(cfg_opt->burst_ceiling * (double)BURST_FP_SCALE);
+    sk->rodata->bw_memfd          = fp(cfg_opt->bw_memfd);
+    sk->rodata->bw_wx             = fp(cfg_opt->bw_wx);
+    sk->rodata->bw_ptrace         = fp(cfg_opt->bw_ptrace);
+    sk->rodata->bw_creds          = fp(cfg_opt->bw_creds);
+    sk->rodata->bw_unshare        = fp(cfg_opt->bw_unshare);
+    sk->rodata->bw_rename         = fp(cfg_opt->bw_rename);
+    sk->rodata->bw_secbpf         = fp(cfg_opt->bw_secbpf);
+    sk->rodata->bw_connect        = fp(cfg_opt->bw_connect);
+    sk->rodata->bw_exec           = fp(cfg_opt->bw_exec);
 
     if (edr_bpf__load(sk)) {
         std::fprintf(stderr, "skel load fail (errno=%d %s)\n", errno, std::strerror(errno));
@@ -123,7 +134,10 @@ int main(int argc, char **argv) {
 
     tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids),
                             bpf_map__fd(sk->maps.enforce_on));
+    tr->set_burst_fds(bpf_map__fd(sk->maps.burst_epoch),
+                      bpf_map__fd(sk->maps.exempt_tgids));
     tr->set_enforcement(cfg_opt->enforce_enabled);
+    tr->seed_from_proc();
 
     struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(sk->maps.rb), rb_cb, tr.get(), nullptr);
     if (!rb) {

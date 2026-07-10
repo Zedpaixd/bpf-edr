@@ -98,6 +98,25 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
         gb("deny_connect", c.deny_connect);
         gb("block_descendants", c.block_descendants);
         gb("emit_deny_events", c.emit_deny_events);
+        if (en.contains("burst")) {
+            auto &b = en["burst"];
+            if (b.contains("enabled")) c.burst_enabled = b["enabled"].get<bool>();
+            if (b.contains("ceiling")) c.burst_ceiling = b["ceiling"].get<double>();
+            if (b.contains("window_ms")) c.burst_window_ms = b["window_ms"].get<int>();
+            if (b.contains("weights")) {
+                auto &w = b["weights"];
+                auto gw = [&](const char *k, double &dst){ if (w.contains(k)) dst = w[k].get<double>(); };
+                gw("memfd_create", c.bw_memfd);
+                gw("mprotect_wx", c.bw_wx);
+                gw("ptrace", c.bw_ptrace);
+                gw("commit_creds", c.bw_creds);
+                gw("unshare", c.bw_unshare);
+                gw("prctl_rename", c.bw_rename);
+                gw("sec_bpf", c.bw_secbpf);
+                gw("tcp_connect", c.bw_connect);
+                gw("exec", c.bw_exec);
+            }
+        }
     }
     return c;
 }

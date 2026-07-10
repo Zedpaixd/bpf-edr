@@ -50,6 +50,27 @@ struct {
     __type(value, __u32);
 } enforce_on SEC(".maps");
 
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u32);
+    __type(value, struct burst_val);
+} burst_win SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} burst_epoch SEC(".maps");
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 8192);
+    __type(key, __u32);
+    __type(value, __u8);
+} exempt_tgids SEC(".maps");
+
 volatile const __u8  deny_exec         = 1;
 volatile const __u8  deny_wx           = 1;
 volatile const __u8  deny_setuid       = 1;
@@ -58,6 +79,18 @@ volatile const __u8  deny_connect      = 1;
 volatile const __u8  block_descendants = 1;
 volatile const __u8  emit_deny_events  = 1;
 volatile const __u32 self_tgid         = 0;
+
+volatile const __u8  burst_enabled     = 1;
+volatile const __u64 burst_ceiling_fp  = 983040;
+volatile const __u32 bw_memfd          = 131072;
+volatile const __u32 bw_wx             = 163840;
+volatile const __u32 bw_ptrace         = 163840;
+volatile const __u32 bw_creds          = 196608;
+volatile const __u32 bw_unshare        = 98304;
+volatile const __u32 bw_rename         = 0;
+volatile const __u32 bw_secbpf         = 98304;
+volatile const __u32 bw_connect        = 65536;
+volatile const __u32 bw_exec           = 0;
 
 static __always_inline __u32 rd_pgid(struct task_struct *t) {
     if (!t) return 0;
@@ -99,6 +132,46 @@ static __always_inline struct edr_event *ev_reserve(__u8 ty) {
     __builtin_memset(e, 0, sizeof(*e));
     e->ev_type = ty;
     return e;
+}
+
+static __always_inline __u32 cur_epoch(void) {
+    __u32 z = 0;
+    __u32 *e = bpf_map_lookup_elem(&burst_epoch, &z);
+    return e ? *e : 0;
+}
+
+static __always_inline void burst_add(__u32 w_fp) {
+    if (!burst_enabled || w_fp == 0) return;
+    __u64 pt = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pt >> 32);
+    if (tgid <= 1 || tgid == self_tgid) return;
+    if (bpf_map_lookup_elem(&exempt_tgids, &tgid)) return;
+    __u32 ep = cur_epoch();
+    __u64 sum;
+    struct burst_val *v = bpf_map_lookup_elem(&burst_win, &tgid);
+    if (v) {
+        if (v->epoch != ep) { v->sum_fp = 0; v->epoch = ep; }
+        v->sum_fp += w_fp;
+        sum = v->sum_fp;
+    } else {
+        struct burst_val nv = {};
+        nv.sum_fp = w_fp;
+        nv.epoch = ep;
+        bpf_map_update_elem(&burst_win, &tgid, &nv, BPF_ANY);
+        sum = w_fp;
+    }
+    if (sum >= burst_ceiling_fp && !bpf_map_lookup_elem(&blocked_tgids, &tgid)) {
+        struct blk_val bv = {};
+        bv.armed_ns = bpf_ktime_get_ns();
+        bv.mode = 1;
+        bpf_map_update_elem(&blocked_tgids, &tgid, &bv, BPF_ANY);
+        struct edr_event *e = ev_reserve(EV_BURST_TRIP);
+        if (e) {
+            fill_meta(e);
+            e->data.burst.weight_fp = (sum > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (__u32)sum;
+            bpf_ringbuf_submit(e, 0);
+        }
+    }
 }
 
 SEC("tracepoint/sched/sched_process_fork")
@@ -149,6 +222,7 @@ int tp_execve(struct trace_event_raw_sys_enter *ctx) {
     if (!s) return 0;
     __builtin_memset(s->buf, 0, MAX_ARG_LEN);
     grab_argv((const char *const *)ctx->args[1], s->buf);
+    burst_add(bw_exec);
     struct edr_event *e = ev_reserve(EV_EXEC);
     if (!e) return 0;
     fill_meta(e);
@@ -164,6 +238,7 @@ int tp_execveat(struct trace_event_raw_sys_enter *ctx) {
     if (!s) return 0;
     __builtin_memset(s->buf, 0, MAX_ARG_LEN);
     grab_argv((const char *const *)ctx->args[2], s->buf);
+    burst_add(bw_exec);
     struct edr_event *e = ev_reserve(EV_EXEC);
     if (!e) return 0;
     fill_meta(e);
@@ -177,6 +252,7 @@ int tp_prctl(struct trace_event_raw_sys_enter *ctx) {
     __u32 op = (__u32)ctx->args[0];
     if (op != PR_SET_NAME) return 0;
     const char *nm = (const char *)ctx->args[1];
+    burst_add(bw_rename);
     struct edr_event *e = ev_reserve(EV_PRCTL_RENAME);
     if (!e) return 0;
     fill_meta(e);
@@ -187,6 +263,7 @@ int tp_prctl(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_ptrace")
 int tp_ptrace(struct trace_event_raw_sys_enter *ctx) {
+    burst_add(bw_ptrace);
     struct edr_event *e = ev_reserve(EV_PTRACE);
     if (!e) return 0;
     fill_meta(e);
@@ -198,6 +275,7 @@ int tp_ptrace(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_unshare")
 int tp_unshare(struct trace_event_raw_sys_enter *ctx) {
+    burst_add(bw_unshare);
     struct edr_event *e = ev_reserve(EV_UNSHARE);
     if (!e) return 0;
     fill_meta(e);
@@ -210,6 +288,7 @@ SEC("tracepoint/syscalls/sys_enter_mprotect")
 int tp_mprotect(struct trace_event_raw_sys_enter *ctx) {
     __u32 prot = (__u32)ctx->args[2];
     if (!((prot & 0x2) && (prot & 0x4))) return 0;
+    burst_add(bw_wx);
     struct edr_event *e = ev_reserve(EV_MPROTECT_WX);
     if (!e) return 0;
     fill_meta(e);
@@ -224,6 +303,7 @@ SEC("kretprobe/__x64_sys_memfd_create")
 int krp_memfd(struct pt_regs *ctx) {
     long ret = PT_REGS_RC(ctx);
     if (ret < 0) return 0;
+    burst_add(bw_memfd);
     struct edr_event *e = ev_reserve(EV_MEMFD_CREATE);
     if (!e) return 0;
     fill_meta(e);
@@ -239,6 +319,7 @@ int kp_commit_creds(struct pt_regs *ctx) {
     __u32 nu = BPF_CORE_READ(newc, uid.val);
     __u32 cu = (__u32)bpf_get_current_uid_gid();
     if (nu != 0 || cu == 0) return 0;
+    burst_add(bw_creds);
     struct edr_event *e = ev_reserve(EV_COMMIT_CREDS);
     if (!e) return 0;
     fill_meta(e);
@@ -251,6 +332,7 @@ int kp_commit_creds(struct pt_regs *ctx) {
 SEC("kprobe/security_bpf")
 int kp_sec_bpf(struct pt_regs *ctx) {
     __u32 cmd = (__u32)PT_REGS_PARM1(ctx);
+    burst_add(bw_secbpf);
     struct edr_event *e = ev_reserve(EV_SEC_BPF);
     if (!e) return 0;
     fill_meta(e);
@@ -265,6 +347,7 @@ int kp_tcp_conn(struct pt_regs *ctx) {
     if (!sk) return 0;
     __u16 fam = BPF_CORE_READ(sk, __sk_common.skc_family);
     if (fam != AF_INET) return 0;
+    burst_add(bw_connect);
     struct edr_event *e = ev_reserve(EV_TCP_CONNECT);
     if (!e) return 0;
     fill_meta(e);

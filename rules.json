@@ -34,7 +34,23 @@
         "deny_ptrace": true,
         "deny_connect": true,
         "block_descendants": true,
-        "emit_deny_events": true
+        "emit_deny_events": true,
+        "burst": {
+            "enabled": true,
+            "ceiling": 15.0,
+            "window_ms": 500,
+            "weights": {
+                "memfd_create": 2.0,
+                "mprotect_wx": 2.5,
+                "ptrace": 2.5,
+                "commit_creds": 3.0,
+                "unshare": 1.5,
+                "prctl_rename": 0.0,
+                "sec_bpf": 1.5,
+                "tcp_connect": 1.0,
+                "exec": 0.0
+            }
+        }
     },
     "categories": {
         "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },

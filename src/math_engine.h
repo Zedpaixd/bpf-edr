@@ -62,6 +62,18 @@ struct EngineCfg {
     bool deny_connect = true;
     bool block_descendants = true;
     bool emit_deny_events = true;
+    bool burst_enabled = true;
+    double burst_ceiling = 15.0;
+    int burst_window_ms = 500;
+    double bw_memfd = 2.0;
+    double bw_wx = 2.5;
+    double bw_ptrace = 2.5;
+    double bw_creds = 3.0;
+    double bw_unshare = 1.5;
+    double bw_rename = 0.0;
+    double bw_secbpf = 1.5;
+    double bw_connect = 1.0;
+    double bw_exec = 0.0;
 };
 
 class MathEng {
