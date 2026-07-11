@@ -166,52 +166,14 @@ void Tracker::log_alert(const std::string &s) {
     if (alerts_.size() > 200) alerts_.pop_front();
 }
 
-bool Tracker::synth_node_from_proc(std::uint32_t tgid) {
-    char path[64];
-    std::snprintf(path, sizeof(path), "/proc/%u/stat", tgid);
-    int fd = ::open(path, O_RDONLY);
-    if (fd < 0) return false;
-    char buf[512];
-    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
-    ::close(fd);
-    if (n <= 0) return false;
-    buf[n] = 0;
-    char *lp = std::strchr(buf, '(');
-    char *rp = std::strrchr(buf, ')');
-    if (!lp || !rp || lp >= rp) return false;
-    char state; unsigned ppid = 0, pgid = 0;
-    if (std::sscanf(rp + 1, " %c %u %u", &state, &ppid, &pgid) != 3) return false;
-
-    auto sn = std::make_shared<ProcNode>();
-    double t = now_sec();
-    std::uint64_t tns = (std::uint64_t)(t * 1e9);
-    sn->uid = mk_uid(tgid, tns);
-    sn->pid = tgid; sn->tgid = tgid; sn->ppid = ppid; sn->pgid = pgid;
-    sn->is_new = true;
-    std::size_t clen = static_cast<std::size_t>(rp - lp - 1);
-    if (clen >= MAX_COMM) clen = MAX_COMM - 1;
-    std::memcpy(sn->comm, lp + 1, clen);
-    sn->comm[clen] = 0;
-    sn->exempt = false;
-    sn->supervised = true;
-    sn->created_ts = t; sn->last_ev_ts = t; sn->last_score_ts = t;
-    auto par = lookup_by_pid(ppid);
-    if (par) { sn->parent = par; par->children.push_back(sn); }
-    else roots_.push_back(sn);
-    nodes_[sn->uid] = sn;
-    pid_to_uid_[tgid] = sn->uid;
-    return true;
-}
-
 void Tracker::register_supervised(std::uint32_t tgid) {
     if (tgid == 0) return;
     std::unique_lock<std::shared_mutex> lk(g_lock_);
     supervised_roots_.insert(tgid);
     auto n = lookup_by_pid(tgid);
-    if (n) { n->supervised = true; n->exempt = false; }
+    if (n) n->supervised = true;
     char m[128];
-    std::snprintf(m, sizeof(m),
-        "[SECCOMP] now supervising pid=%u (eBPF muted for its tree; scoring only)", tgid);
+    std::snprintf(m, sizeof(m), "[SECCOMP] now supervising pid=%u (eBPF muted for its tree; scoring only)", tgid);
     log_alert(m);
 }
 
@@ -328,16 +290,12 @@ void Tracker::seccomp_persist_hash(std::uint32_t tgid, bool blacklist) {
         auto hit = tgid_hash_.find(tgid);
         if (hit != tgid_hash_.end()) hash = hit->second;
     }
-    path = rep_->resolve_exe(tgid);
     if (hash.empty()) {
         bool ok = false;
         hash = Reputation::hash_of_pid(tgid, ok);
         if (!ok) hash.clear();
     }
-    if (comm.empty() && !path.empty()) {
-        std::size_t sl = path.find_last_of('/');
-        comm = (sl == std::string::npos) ? path : path.substr(sl + 1);
-    }
+    path = rep_->resolve_exe(tgid);
     if (hash.empty()) {
         char m[128];
         std::snprintf(m, sizeof(m), "[SECCOMP] pid=%u hash persist FAILED (no readable exe)", tgid);
@@ -760,10 +718,6 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
             if (!ok) hash.clear();
         }
         if (rep_) path = rep_->resolve_exe(tgid);
-        if (comm.empty() && !path.empty()) {
-            std::size_t sl = path.find_last_of('/');
-            comm = (sl == std::string::npos) ? path : path.substr(sl + 1);
-        }
         bool ok = false;
         if (rep_ && !hash.empty())
             ok = rep_->add(kind, hash, comm, path);
@@ -1010,7 +964,6 @@ void Tracker::ingest(const edr_event &e) {
         if (n && e.ev_type == EV_EXEC) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
             n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
-            // if (supervised) n->exempt = false;
             kernel_exempt(n->tgid, n->exempt);
             tgid_hash_.erase(n->tgid);
             if (!n->exempt && !supervised && !n->rep_checked) {

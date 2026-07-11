@@ -33,7 +33,6 @@ static const char *km_name(KmAction a) {
         case KM_REP_REMOVE: return "repman_remove";
         case KM_SUP_VIEW: return "supervised_view";
         case KM_SUP_INPUT: return "supervised_input";
-        case KM_SUP_SKIP: return "supervised_skip_unscored";
         default: return "";
     }
 }
@@ -66,7 +65,6 @@ void Keymap::set_defaults() {
     keys_[KM_REP_REMOVE] = "x";
     keys_[KM_SUP_VIEW] = "o";
     keys_[KM_SUP_INPUT] = "i";
-    keys_[KM_SUP_SKIP] = "u";
 }
 
 void Keymap::load(const std::string &path, std::string &note) {

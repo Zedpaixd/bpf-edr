@@ -23,7 +23,7 @@ using uic::fmt_pct;
 using uic::hclip;
 using uic::wrap_indent;
 
-enum ActiveModal { AM_NONE = 0, AM_SECCOMP, AM_EBPF, AM_REPMAN, AM_LAUNCH, AM_SUPOUT };
+enum ActiveModal { AM_NONE = 0, AM_SECCOMP, AM_EBPF, AM_REPMAN, AM_LAUNCH };
 
 struct FlatRow {
     int depth;
@@ -319,7 +319,7 @@ static Element build_seccomp_modal(const SeccompPrompt &p, const Keymap &km, int
     } else {
         riskline = "eBPF confidence: " + fmt_pct(p.risk_current)
                  + "  ->  " + fmt_pct(p.risk_current)
-                 + "  | Unmonitored syscall";
+                 + "  [syscall not accounted for in eBPF model]";
         rc = risk_color(p.risk_current);
     }
     v.push_back(wrap_indent(riskline, inner, 0, rc, true));
@@ -358,61 +358,11 @@ static Element build_launch_modal(const std::string &buf, int width) {
     v.push_back(text(""));
     v.push_back(separator());
     v.push_back(text("  [Enter] launch    [Esc] cancel") | color(Color::GrayLight));
-    v.push_back(text("  its stdout/stderr is captured — press [o] afterwards to read it") | dim);
-    v.push_back(text("  e.g.  ./bin/flood_trigger /tmp/fp.txt 1") | dim);
+    v.push_back(text("  e.g.  ./build/flood_trigger /tmp/fp.txt 1") | dim);
     v.push_back(text("  e.g.  /bin/bash ./test/run_flood.sh") | dim);
     return window(text(" SUPERVISE ") | bold | color(Color::CyanLight),
                   vbox(std::move(v)))
            | size(WIDTH, EQUAL, width) | bgcolor(Color::Black) | clear_under;
-}
-
-static Element build_supout_modal(const std::vector<std::string> &lines,
-                                  const std::string &inbuf, bool input_mode,
-                                  bool live, bool skip_on, std::uint32_t pid,
-                                  std::uint64_t gated, std::uint64_t auto_allowed,
-                                  const Keymap &km, int width, int height) {
-    int inner = width - 4;
-    if (inner < 32) inner = 32;
-
-    Elements body;
-    if (lines.empty()) {
-        body.push_back(text(" (no output captured — nothing has been supervised yet) ") | dim | center);
-    } else {
-        for (auto &l : lines)
-            body.push_back(wrap_indent(l, inner, 2, Color::GrayLight, false));
-    }
-
-    char meta[224];
-    std::snprintf(meta, sizeof(meta),
-        " %s | pid %u | gated: %llu | auto-allowed: %llu | skip-unmonitored: %s | lines: %zu ",
-        live ? "RUNNING" : "not running",
-        pid, (unsigned long long)gated, (unsigned long long)auto_allowed,
-        skip_on ? "ON" : "off", lines.size());
-
-    Elements v;
-    v.push_back(text(meta) | dim);
-    v.push_back(separator());
-    v.push_back(vbox(std::move(body)) | vscroll_indicator | yframe | focus | flex);
-    v.push_back(separator());
-
-    if (input_mode) {
-        v.push_back(wrap_indent(" > " + inbuf + "_", inner, 3, Color::White, true));
-        v.push_back(text("  [Enter] send to its stdin (empty Enter sends a blank line)    [Esc] leave input mode")
-                    | color(Color::GrayLight));
-    } else {
-        std::string hint = "  [" + km.key_for(KM_SUP_INPUT) + "] type into its stdin    ["
-                         + km.key_for(KM_SUP_SKIP) + "] toggle skip-unmonitored    ["
-                         + km.key_for(KM_SUP_VIEW) + "] / [Esc] close";
-        v.push_back(text(hint) | color(Color::GrayLight));
-        if (!live)
-            v.push_back(text("  (process has exited — stdin is closed)") | dim);
-    }
-
-    Color hdr = live ? Color::CyanLight : Color::GrayDark;
-    return window(text(" Supervised Process Output ") | bold | color(hdr),
-                  vbox(std::move(v)))
-           | size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height)
-           | bgcolor(Color::Black) | clear_under;
 }
 
 static std::vector<std::string> split_cmd(const std::string &s) {
@@ -437,8 +387,6 @@ void Ui::run() {
     PromptReq ebpf_active;
     SeccompPrompt sec_active;
     std::string launch_buf;
-    std::string sup_buf;
-    bool sup_input = false;
     int roff = 0, hoff_l = 0;
     const int VIS_AUDIT = 10;
     const int RIGHT_W = 62;
@@ -451,10 +399,10 @@ void Ui::run() {
     double prev_t = 0.0, ema_rate = 0.0;
 
     auto renderer = Renderer([&]() {
-        if (modal == AM_NONE || modal == AM_SUPOUT) {
+        if (modal == AM_NONE) {
             SeccompPrompt sp;
-            if (sup_ && sup_->peek_prompt(sp)) { sec_active = sp; modal = AM_SECCOMP; sup_input = false; }
-            else if (modal == AM_NONE && tr_->prompts_enabled()) {
+            if (sup_ && sup_->peek_prompt(sp)) { sec_active = sp; modal = AM_SECCOMP; }
+            else if (tr_->prompts_enabled()) {
                 auto p = tr_->take_prompt();
                 if (p) { ebpf_active = *p; modal = AM_EBPF; }
             }
@@ -492,9 +440,9 @@ void Ui::run() {
         if (sup_ && sup_->active())
             sup_state = "pid " + std::to_string(sup_->child_pid());
 
-        char status[560];
+        char status[460];
         std::snprintf(status, sizeof(status),
-            " EDR | ev=%llu %.0f/s | kills=%llu burst=%llu rep=%llu deny=%llu | watch=%zu frozen=%zu blk=%zu | supervise:%s | ENF:%s | %s | %s | [%s]launch [%s]output [%s]rep [%s]keys [%s]quit ",
+            " EDR | ev=%llu %.0f/s | kills=%llu burst=%llu rep=%llu deny=%llu | watch=%zu frozen=%zu blk=%zu | supervise:%s | ENF:%s | %s | %s | [%s]launch [%s]rep [%s]keys [%s]quit ",
             (unsigned long long)tr_->ev_count(), ema_rate,
             (unsigned long long)tr_->kills_issued(),
             (unsigned long long)tr_->burst_trips(),
@@ -504,12 +452,9 @@ void Ui::run() {
             sup_state.c_str(),
             tr_->enforcement_on() ? "on" : "OFF",
             armed, new_only ? "NEW" : "ALL",
-            km_.key_for(KM_LAUNCH).c_str(), km_.key_for(KM_SUP_VIEW).c_str(),
-            km_.key_for(KM_REPMAN).c_str(),
+            km_.key_for(KM_LAUNCH).c_str(), km_.key_for(KM_REPMAN).c_str(),
             km_.key_for(KM_KEYPANE).c_str(), km_.key_for(KM_QUIT).c_str());
         Color barcol = (modal == AM_SECCOMP) ? Color::CyanLight
-                     : (modal == AM_EBPF) ? Color::Red
-                     : (modal == AM_SUPOUT) ? Color::CyanLight
                      : (modal != AM_NONE) ? Color::Red
                      : (paused ? Color::Magenta : Color::Blue);
 
@@ -548,25 +493,6 @@ void Ui::run() {
             int mw = std::min(80, screen.dimx() - 4);
             return dbox({ bview | dim, build_launch_modal(launch_buf, mw) | center });
         }
-        if (modal == AM_SUPOUT) {
-            int mw = std::min(screen.dimx() - 4, std::max(60, screen.dimx() * 4 / 5));
-            int mh = std::max(12, screen.dimy() - 6);
-            std::vector<std::string> lines;
-            bool live = false, skip_on = false;
-            std::uint32_t cpid = 0;
-            std::uint64_t gated = 0, autoa = 0;
-            if (sup_) {
-                lines = sup_->output_lines((std::size_t)std::max(1, mh - 8));
-                live = sup_->active();
-                skip_on = sup_->skip_unscored();
-                cpid = sup_->child_pid();
-                gated = sup_->gated_count();
-                autoa = sup_->auto_allowed();
-            }
-            return dbox({ bview | dim,
-                          build_supout_modal(lines, sup_buf, sup_input, live, skip_on,
-                                             cpid, gated, autoa, km_, mw, mh) | center });
-        }
         if (modal == AM_REPMAN) {
             int rw = std::min(screen.dimx() - 4, std::max(60, screen.dimx() * 3 / 4));
             return dbox({ bview | dim,
@@ -591,7 +517,6 @@ void Ui::run() {
             else if (e == Event::Escape) return true;
             if (d != SD_PENDING) {
                 if (sup_) sup_->resolve(sec_active.token, d);
-                if (d == SD_BLACKLIST || d == SD_WHITELIST) repman_dirty = true;
                 modal = AM_NONE;
             }
             return true;
@@ -607,39 +532,6 @@ void Ui::run() {
             else if (km_.matches(e, KM_SESSION_WL)) dec = 'w';
             else if (e == Event::Escape) dec = 'x';
             if (dec) { tr_->resolve_prompt(ebpf_active.uid, ebpf_active.pgid, dec); modal = AM_NONE; }
-            return true;
-        }
-        if (modal == AM_SUPOUT) {
-            if (sup_input) {
-                if (e == Event::Escape) { sup_input = false; return true; }
-                if (e == Event::Return) {
-                    if (sup_ && sup_->active())
-                        sup_->write_stdin(sup_buf);
-                    sup_buf.clear();
-                    return true;
-                }
-                if (e == Event::Backspace) {
-                    if (!sup_buf.empty()) sup_buf.pop_back();
-                    return true;
-                }
-                if (e.is_character()) {
-                    std::string ch = e.character();
-                    if (!ch.empty() && (unsigned char)ch[0] >= 0x20) sup_buf += ch;
-                    return true;
-                }
-                return true;
-            }
-            if (e == Event::Escape || km_.matches(e, KM_SUP_VIEW)) {
-                modal = AM_NONE; sup_buf.clear(); return true;
-            }
-            if (km_.matches(e, KM_SUP_INPUT)) {
-                if (sup_ && sup_->active()) sup_input = true;
-                return true;
-            }
-            if (km_.matches(e, KM_SUP_SKIP)) {
-                if (sup_) sup_->set_skip_unscored(!sup_->skip_unscored());
-                return true;
-            }
             return true;
         }
         if (modal == AM_REPMAN) {
@@ -659,12 +551,8 @@ void Ui::run() {
                     SeccompGates g;
                     std::string err;
                     if (sup_->launch(argv, g, err)) {
+                        tr_->register_supervised(sup_->child_pid());
                         tr_->push_alert("[SECCOMP] launched under supervision: " + lb);
-                        tr_->push_alert("[SECCOMP] press [" + km_.key_for(KM_SUP_VIEW)
-                                        + "] to view its output");
-                        sup_buf.clear();
-                        sup_input = false;
-                        modal = AM_SUPOUT;
                     } else {
                         tr_->push_alert("[SECCOMP] launch failed: " + err);
                     }
@@ -697,9 +585,6 @@ void Ui::run() {
             screen.ExitLoopClosure()(); return true;
         }
         if (km_.matches(e, KM_LAUNCH)) { modal = AM_LAUNCH; launch_buf.clear(); return true; }
-        if (km_.matches(e, KM_SUP_VIEW)) {
-            modal = AM_SUPOUT; sup_input = false; sup_buf.clear(); return true;
-        }
         if (km_.matches(e, KM_REPMAN)) { modal = AM_REPMAN; repman_dirty = true; repman_sel = 0; return true; }
         if (km_.matches(e, KM_KEYPANE)) { keys_forced = true; show_keys = !show_keys; keys_scroll = 0; return true; }
         if (km_.matches(e, KM_PAUSE)) {

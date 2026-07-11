@@ -23,6 +23,5 @@
     "repman_pause": "p",
     "repman_remove": "x",
     "supervised_view": "o",
-    "supervised_input": "i",
-    "supervised_skip_unscored": "u"
+    "supervised_input": "i"
 }

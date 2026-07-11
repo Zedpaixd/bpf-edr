@@ -205,7 +205,6 @@ private:
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
     std::shared_ptr<ProcNode> ensure_node(const edr_event &e);
     std::shared_ptr<ProcNode> fork_node(const edr_event &e);
-    bool synth_node_from_proc(std::uint32_t tgid);
     std::string ev_key(std::uint8_t t) const;
     bool self_pid(std::uint32_t pid, std::uint32_t pgid) const;
     bool is_self(const edr_event &e) const;

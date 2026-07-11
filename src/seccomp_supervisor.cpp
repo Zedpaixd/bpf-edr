@@ -106,7 +106,6 @@ bool SeccompSupervisor::launch(const std::vector<std::string> &argv,
     child_pid_.store((std::uint32_t)child);
     if (tr_) tr_->register_supervised((std::uint32_t)child);
     gated_.store(0);
-    auto_allowed_.store(0);
     stop_.store(false);
     {
         std::lock_guard<std::mutex> lk(out_mtx_);
@@ -260,15 +259,6 @@ void SeccompSupervisor::supervise() {
             p.scores_ebpf = rp.scores;
             p.comm = rp.comm;
             p.exe_path = rp.exe_path;
-        }
-
-        if (skip_unscored_.load() && p.risk_known && !p.scores_ebpf) {
-            std::memset(resp, 0, sizes.seccomp_notif_resp);
-            resp->id = req->id;
-            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
-            ioctl(notify_fd_, SECCOMP_IOCTL_NOTIF_SEND, resp);
-            auto_allowed_.fetch_add(1);
-            continue;
         }
 
         {

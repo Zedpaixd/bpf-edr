@@ -142,6 +142,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGCHLD, SIG_IGN);
     libbpf_set_print(libbpf_verbose);
     bump_rlim();
 
