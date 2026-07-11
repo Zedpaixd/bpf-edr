@@ -113,6 +113,23 @@ static __always_inline __u32 rd_ppid(struct task_struct *t) {
     return BPF_CORE_READ(t, real_parent, tgid);
 }
 
+static __always_inline int in_self_tree(void) {
+    __u64 pt = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pt >> 32);
+    if (tgid == self_tgid) return 1;
+    struct task_struct *t = bpf_get_current_task_btf();
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        if (!t) break;
+        t = BPF_CORE_READ(t, real_parent);
+        if (!t) break;
+        __u32 ptg = BPF_CORE_READ(t, tgid);
+        if (ptg == 0 || ptg == 1) break;
+        if (ptg == self_tgid) return 1;
+    }
+    return 0;
+}
+
 static __always_inline void fill_meta(struct edr_event *e) {
     struct task_struct *t = (struct task_struct *)bpf_get_current_task();
     __u64 pt = bpf_get_current_pid_tgid();
@@ -144,7 +161,8 @@ static __always_inline void burst_add(__u32 w_fp) {
     if (!burst_enabled || w_fp == 0) return;
     __u64 pt = bpf_get_current_pid_tgid();
     __u32 tgid = (__u32)(pt >> 32);
-    if (tgid <= 1 || tgid == self_tgid) return;
+    if (tgid <= 1) return;
+    if (in_self_tree()) return;
     if (bpf_map_lookup_elem(&exempt_tgids, &tgid)) return;
     __u32 ep = cur_epoch();
     __u64 sum;
@@ -369,6 +387,7 @@ static __always_inline int is_blocked(void) {
     __u64 pt = bpf_get_current_pid_tgid();
     __u32 tgid = (__u32)(pt >> 32);
     if (tgid == self_tgid) return 0;
+    if (bpf_map_lookup_elem(&exempt_tgids, &tgid)) return 0;
     if (bpf_map_lookup_elem(&blocked_tgids, &tgid)) return 1;
     if (!block_descendants) return 0;
     struct task_struct *t = bpf_get_current_task_btf();
@@ -380,6 +399,7 @@ static __always_inline int is_blocked(void) {
         __u32 ptg = BPF_CORE_READ(t, tgid);
         if (ptg == 0 || ptg == 1) break;
         if (ptg == self_tgid) return 0;
+        if (bpf_map_lookup_elem(&exempt_tgids, &ptg)) return 0;
         if (bpf_map_lookup_elem(&blocked_tgids, &ptg)) return 1;
     }
     return 0;

@@ -170,6 +170,7 @@ void Tracker::register_supervised(std::uint32_t tgid) {
     if (tgid == 0) return;
     std::unique_lock<std::shared_mutex> lk(g_lock_);
     supervised_roots_.insert(tgid);
+    kernel_exempt(tgid, true);
     auto n = lookup_by_pid(tgid);
     if (n) n->supervised = true;
     char m[128];
@@ -776,7 +777,13 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
             if (a == PA_WHITELIST) { n->exempt = true; n->blocked = false; kernel_exempt(n->tgid, true); }
         }
     }
-    if ((a == PA_WHITELIST || a == PA_KILL) && tgid != 0) disarm_block(tgid);
+
+    if ((a == PA_RESUME || a == PA_WHITELIST || a == PA_KILL) && tgid != 0) {
+        disarm_block(tgid);
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto it = nodes_.find(uid);
+        if (it != nodes_.end() && it->second) it->second->blocked = false;
+    }
 
     bool ok = (pgid > 1 && pgid != own_pgid_);
     switch (a) {
