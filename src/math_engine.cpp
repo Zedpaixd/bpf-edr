@@ -118,6 +118,10 @@ std::optional<EngineCfg> MathEng::load(const std::string &path) {
             }
         }
     }
+    if (j.contains("reputation")) {
+        auto &r = j["reputation"];
+        if (r.contains("store_path")) c.reputation_path = r["store_path"].get<std::string>();
+    }
     return c;
 }
 

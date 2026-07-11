@@ -62,6 +62,7 @@ struct EngineCfg {
     bool deny_connect = true;
     bool block_descendants = true;
     bool emit_deny_events = true;
+    std::string reputation_path = "/etc/edr/reputation.json";
     bool burst_enabled = true;
     double burst_ceiling = 15.0;
     int burst_window_ms = 500;

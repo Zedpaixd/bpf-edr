@@ -52,6 +52,9 @@
             }
         }
     },
+    "reputation": {
+        "store_path": "/etc/edr/reputation.json"
+    },
     "categories": {
         "lifecycle": { "max_llr": 0.3, "scale": 4.0, "half_life_sec": 20.0 },
         "execution": { "max_llr": 2.0, "scale": 2.5, "half_life_sec": 45.0 },

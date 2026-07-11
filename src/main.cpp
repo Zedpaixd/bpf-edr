@@ -1,6 +1,9 @@
 #include "common.h"
 #include "math_engine.h"
+#include "reputation.h"
 #include "tracker.h"
+#include "keymap.h"
+#include "seccomp_supervisor.h"
 #include "ui.h"
 #include "edr.skel.h"
 #include <bpf/libbpf.h>
@@ -8,11 +11,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fcntl.h>
 #include <memory>
 #include <signal.h>
+#include <string>
 #include <sys/resource.h>
+#include <termios.h>
 #include <thread>
 #include <unistd.h>
+#include <vector>
 
 static std::atomic<bool> g_run{true};
 static Tracker *g_tr = nullptr;
@@ -32,23 +39,15 @@ static int rb_cb(void *ctx, void *data, std::size_t sz) {
 }
 
 static void try_attach(bpf_program *p, Tracker *tr, const char *nm) {
-    if (!p) {
-        tr->note_hook_fail();
-        tr->push_alert(std::string("[hook] missing prog: ") + nm);
-        return;
-    }
+    if (!p) { tr->note_hook_fail(); tr->push_alert(std::string("[hook] missing prog: ") + nm); return; }
     errno = 0;
     struct bpf_link *lk = bpf_program__attach(p);
     if (!lk) {
-        int e = errno;
-        tr->note_hook_fail();
+        int e = errno; tr->note_hook_fail();
         char msg[256];
-        std::snprintf(msg, sizeof(msg), "[hook] FAIL %s (errno=%d %s)",
-                      nm, e, std::strerror(e));
+        std::snprintf(msg, sizeof(msg), "[hook] FAIL %s (errno=%d %s)", nm, e, std::strerror(e));
         tr->push_alert(msg);
-    } else {
-        tr->push_alert(std::string("[hook] attached: ") + nm);
-    }
+    } else tr->push_alert(std::string("[hook] attached: ") + nm);
 }
 
 static void bump_rlim() {
@@ -56,31 +55,119 @@ static void bump_rlim() {
     setrlimit(RLIMIT_MEMLOCK, &r);
 }
 
-int main(int argc, char **argv) {
-    if (geteuid() != 0) {
-        std::fprintf(stderr, "must run as root\n");
-        return 1;
+static char tty_key() {
+    int fd = ::open("/dev/tty", O_RDONLY);
+    if (fd < 0) fd = STDIN_FILENO;
+    struct termios old, raw;
+    tcgetattr(fd, &old);
+    raw = old; raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    tcsetattr(fd, TCSANOW, &raw);
+    char c = 0; ssize_t n = read(fd, &c, 1);
+    tcsetattr(fd, TCSANOW, &old);
+    if (fd != STDIN_FILENO) ::close(fd);
+    return n <= 0 ? 0 : c;
+}
+
+struct BindIssue { std::string text; };
+
+static std::vector<BindIssue> validate_binds(const Keymap &km) {
+    std::vector<BindIssue> issues;
+
+    struct Ctx { const char *name; std::vector<KmAction> acts; };
+    std::vector<Ctx> ctxs = {
+        { "dashboard", { KM_QUIT, KM_REPMAN, KM_KEYPANE, KM_LAUNCH, KM_PAUSE, KM_ENFORCE,
+                         KM_CLEAR, KM_NEWONLY, KM_ALL, KM_RESET_H, KM_SEL_UP, KM_SEL_DOWN,
+                         KM_SEL_TOP, KM_SEL_BOTTOM } },
+        { "eBPF modal", { KM_ALLOW, KM_DENY, KM_BLOCK, KM_KILL, KM_BLACKLIST, KM_WHITELIST, KM_SESSION_WL } },
+        { "seccomp modal", { KM_ALLOW, KM_DENY, KM_KILL, KM_BLACKLIST, KM_WHITELIST } },
+        { "reputation manager", { KM_REP_PAUSE, KM_REP_REMOVE, KM_SEL_UP, KM_SEL_DOWN, KM_SEL_TOP, KM_SEL_BOTTOM } },
+    };
+
+    for (int a = 0; a < KM_COUNT; a++) {
+        if (km.key_for((KmAction)a).empty())
+            issues.push_back({ std::string("action index ") + std::to_string(a) + " is not mapped" });
+        if (km.key_for((KmAction)a) == "esc")
+            issues.push_back({ "an action is bound to 'esc', which is reserved for cancel and cannot be rebound" });
     }
+
+    for (auto &cx : ctxs) {
+        for (std::size_t i = 0; i < cx.acts.size(); i++) {
+            for (std::size_t j = i + 1; j < cx.acts.size(); j++) {
+                std::string ki = km.key_for(cx.acts[i]);
+                std::string kj = km.key_for(cx.acts[j]);
+                if (!ki.empty() && ki == kj) {
+                    issues.push_back({ std::string("in ") + cx.name + ": two actions share key '" + ki + "'" });
+                }
+            }
+        }
+    }
+    return issues;
+}
+
+int main(int argc, char **argv) {
+    if (geteuid() != 0) { std::fprintf(stderr, "must run as root\n"); return 1; }
     const char *cfg_path = (argc > 1) ? argv[1] : "rules.json";
     auto cfg_opt = MathEng::load(cfg_path);
-    if (!cfg_opt) {
-        std::fprintf(stderr, "failed to load %s\n", cfg_path);
-        return 1;
+    if (!cfg_opt) { std::fprintf(stderr, "failed to load %s\n", cfg_path); return 1; }
+
+    Keymap km;
+    std::string km_note;
+    km.load("binds.json", km_note);
+    auto issues = validate_binds(km);
+    if (!issues.empty()) {
+        std::printf("\n=== binds.json validation ===\n");
+        std::printf("%s\n", km_note.c_str());
+        std::printf("Problems found:\n");
+        for (auto &is : issues) std::printf("  - %s\n", is.text.c_str());
+        std::printf("\n[d] discard binds.json and use built-in defaults\n");
+        std::printf("[q] quit so you can fix binds.json\n");
+        std::printf("choose (d/q): ");
+        std::fflush(stdout);
+        for (;;) {
+            char c = tty_key();
+            if (c == 'd' || c == 'D') {
+                std::printf("d\nusing default keybinds.\n\n");
+                Keymap def;
+                km = def;
+                break;
+            }
+            if (c == 'q' || c == 'Q' || c == 3) {
+                std::printf("q\nexiting so you can fix binds.json.\n");
+                return 0;
+            }
+        }
     }
+
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
     signal(SIGPIPE, SIG_IGN);
     libbpf_set_print(libbpf_verbose);
     bump_rlim();
 
+    auto rep = std::make_shared<Reputation>(cfg_opt->reputation_path);
+    rep->load();
+
     std::uint32_t opgid = static_cast<std::uint32_t>(getpgid(0));
     std::uint32_t opid  = static_cast<std::uint32_t>(getpid());
-    auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid);
+    auto tr = std::make_shared<Tracker>(*cfg_opt, opgid, opid, rep);
     g_tr = tr.get();
 
+    auto sup = std::make_shared<SeccompSupervisor>();
+    sup->attach_tracker(tr.get());
+
+    if (rep->tamper_flagged())
+        tr->push_alert("[REP] WARNING reputation store checksum mismatch - possible tampering");
+    {
+        char m[128];
+        std::snprintf(m, sizeof(m), "[REP] loaded %zu saved binary verdicts from %s",
+                      rep->count(), rep->store_path().c_str());
+        tr->push_alert(m);
+    }
+    tr->push_alert(std::string("[keys] ") + km_note);
+
     if (access("/sys/kernel/tracing/events/sched/sched_process_fork/id", F_OK) != 0) {
-        std::fprintf(stderr,
-            "tracefs not mounted. run: sudo mount -t tracefs nodev /sys/kernel/tracing\n");
+        std::fprintf(stderr, "tracefs not mounted. run: sudo mount -t tracefs nodev /sys/kernel/tracing\n");
         return 1;
     }
 
@@ -132,19 +219,13 @@ int main(int argc, char **argv) {
     try_attach(sk->progs.lsm_ptrace, tr.get(), "lsm/ptrace_access_check");
     try_attach(sk->progs.lsm_connect, tr.get(), "lsm/socket_connect");
 
-    tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids),
-                            bpf_map__fd(sk->maps.enforce_on));
-    tr->set_burst_fds(bpf_map__fd(sk->maps.burst_epoch),
-                      bpf_map__fd(sk->maps.exempt_tgids));
+    tr->set_enforcement_fds(bpf_map__fd(sk->maps.blocked_tgids), bpf_map__fd(sk->maps.enforce_on));
+    tr->set_burst_fds(bpf_map__fd(sk->maps.burst_epoch), bpf_map__fd(sk->maps.exempt_tgids));
     tr->set_enforcement(cfg_opt->enforce_enabled);
     tr->seed_from_proc();
 
     struct ring_buffer *rb = ring_buffer__new(bpf_map__fd(sk->maps.rb), rb_cb, tr.get(), nullptr);
-    if (!rb) {
-        std::fprintf(stderr, "ringbuf init failed (fatal)\n");
-        edr_bpf__destroy(sk);
-        return 1;
-    }
+    if (!rb) { std::fprintf(stderr, "ringbuf init failed\n"); edr_bpf__destroy(sk); return 1; }
 
     std::thread poller([&]() {
         while (g_run.load() && tr->running()) {
@@ -155,17 +236,15 @@ int main(int argc, char **argv) {
     });
     std::thread engine([&]() {
         auto ms = std::chrono::milliseconds(cfg_opt->tick_ms);
-        while (g_run.load() && tr->running()) {
-            tr->tick();
-            std::this_thread::sleep_for(ms);
-        }
+        while (g_run.load() && tr->running()) { tr->tick(); std::this_thread::sleep_for(ms); }
     });
 
-    Ui ui(tr);
+    Ui ui(tr, sup, km);
     ui.run();
 
     g_run.store(false);
     tr->stop();
+    sup->stop();
     if (poller.joinable()) poller.join();
     if (engine.joinable()) engine.join();
     ring_buffer__free(rb);

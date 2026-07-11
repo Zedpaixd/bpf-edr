@@ -10,7 +10,7 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-add_compile_options(-Wall -Wextra -Wno-unused-parameter -fno-exceptions -fno-rtti)
+add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBBPF REQUIRED libbpf)
@@ -29,6 +29,12 @@ add_executable(edr
     src/math_engine.cpp
     src/tracker.cpp
     src/ui.cpp
+    src/ui_repman.cpp
+    src/reputation.cpp
+    src/sha256.cpp
+    src/keymap.cpp
+    src/seccomp_filter.cpp
+    src/seccomp_supervisor.cpp
 )
 
 target_include_directories(edr PRIVATE
@@ -36,11 +42,15 @@ target_include_directories(edr PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${LIBBPF_INCLUDE_DIRS}
 )
-
 target_link_libraries(edr PRIVATE
     ftxui::screen ftxui::dom ftxui::component
-    ${LIBBPF_LIBRARIES} elf z pthread
+    ${LIBBPF_LIBRARIES} elf z pthread util
 )
-
 target_link_directories(edr PRIVATE ${LIBBPF_LIBRARY_DIRS})
-target_compile_options(edr PRIVATE ${LIBBPF_CFLAGS_OTHER})
+target_compile_options(edr PRIVATE ${LIBBPF_CFLAGS_OTHER} -fno-exceptions -fno-rtti)
+
+add_executable(edr-run
+    debug/edr_run.cpp
+    src/seccomp_filter.cpp
+)
+target_include_directories(edr-run PRIVATE ${CMAKE_SOURCE_DIR}/src)

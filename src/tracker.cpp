@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <bpf/bpf.h>
@@ -80,8 +81,9 @@ static int ev_category(std::uint8_t t) {
     return CAT_LIFECYCLE;
 }
 
-Tracker::Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid)
-    : cfg_(std::move(cfg)), own_pgid_(own_pgid), own_pid_(own_pid) {
+Tracker::Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid,
+                 std::shared_ptr<Reputation> rep)
+    : cfg_(std::move(cfg)), own_pgid_(own_pgid), own_pid_(own_pid), rep_(std::move(rep)) {
     start_ts_ = now_sec();
     last_epoch_bump_ = start_ts_;
     if (cfg_.exempt_comms.empty()) {
@@ -137,6 +139,17 @@ bool Tracker::is_masq_name(const char *nm) const {
     return false;
 }
 
+bool Tracker::node_is_supervised(const std::shared_ptr<ProcNode> &n) const {
+    auto cur = n;
+    int guard = 0;
+    while (cur && guard++ < 256) {
+        if (cur->supervised) return true;
+        if (supervised_roots_.count(cur->tgid)) return true;
+        cur = cur->parent.lock();
+    }
+    return false;
+}
+
 void Tracker::kernel_exempt(std::uint32_t tgid, bool on) {
     if (exempt_fd_ < 0 || tgid == 0) return;
     if (on) {
@@ -151,6 +164,194 @@ void Tracker::log_alert(const std::string &s) {
     std::lock_guard<std::mutex> lk(alert_lock_);
     alerts_.push_back("[" + now_hms_ms() + "] " + s);
     if (alerts_.size() > 200) alerts_.pop_front();
+}
+
+bool Tracker::synth_node_from_proc(std::uint32_t tgid) {
+    char path[64];
+    std::snprintf(path, sizeof(path), "/proc/%u/stat", tgid);
+    int fd = ::open(path, O_RDONLY);
+    if (fd < 0) return false;
+    char buf[512];
+    ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (n <= 0) return false;
+    buf[n] = 0;
+    char *lp = std::strchr(buf, '(');
+    char *rp = std::strrchr(buf, ')');
+    if (!lp || !rp || lp >= rp) return false;
+    char state; unsigned ppid = 0, pgid = 0;
+    if (std::sscanf(rp + 1, " %c %u %u", &state, &ppid, &pgid) != 3) return false;
+
+    auto sn = std::make_shared<ProcNode>();
+    double t = now_sec();
+    std::uint64_t tns = (std::uint64_t)(t * 1e9);
+    sn->uid = mk_uid(tgid, tns);
+    sn->pid = tgid; sn->tgid = tgid; sn->ppid = ppid; sn->pgid = pgid;
+    sn->is_new = true;
+    std::size_t clen = static_cast<std::size_t>(rp - lp - 1);
+    if (clen >= MAX_COMM) clen = MAX_COMM - 1;
+    std::memcpy(sn->comm, lp + 1, clen);
+    sn->comm[clen] = 0;
+    sn->exempt = false;
+    sn->supervised = true;
+    sn->created_ts = t; sn->last_ev_ts = t; sn->last_score_ts = t;
+    auto par = lookup_by_pid(ppid);
+    if (par) { sn->parent = par; par->children.push_back(sn); }
+    else roots_.push_back(sn);
+    nodes_[sn->uid] = sn;
+    pid_to_uid_[tgid] = sn->uid;
+    return true;
+}
+
+void Tracker::register_supervised(std::uint32_t tgid) {
+    if (tgid == 0) return;
+    std::unique_lock<std::shared_mutex> lk(g_lock_);
+    supervised_roots_.insert(tgid);
+    auto n = lookup_by_pid(tgid);
+    if (n) { n->supervised = true; n->exempt = false; }
+    char m[128];
+    std::snprintf(m, sizeof(m),
+        "[SECCOMP] now supervising pid=%u (eBPF muted for its tree; scoring only)", tgid);
+    log_alert(m);
+}
+
+void Tracker::unregister_supervised(std::uint32_t tgid) {
+    if (tgid == 0) return;
+    std::unique_lock<std::shared_mutex> lk(g_lock_);
+    supervised_roots_.erase(tgid);
+    char m[96];
+    std::snprintf(m, sizeof(m), "[SECCOMP] supervision ended for pid=%u", tgid);
+    log_alert(m);
+}
+
+int Tracker::syscall_to_evtype(int nr, std::uint64_t a0, std::uint64_t a2) const {
+#ifdef __NR_memfd_create
+    if (nr == __NR_memfd_create) return EV_MEMFD_CREATE;
+#endif
+#ifdef __NR_mprotect
+    if (nr == __NR_mprotect) {
+        bool wx = (a2 & 0x2) && (a2 & 0x4);
+        return wx ? EV_MPROTECT_WX : -1;
+    }
+#endif
+#ifdef __NR_ptrace
+    if (nr == __NR_ptrace) return EV_PTRACE;
+#endif
+#ifdef __NR_unshare
+    if (nr == __NR_unshare) return EV_UNSHARE;
+#endif
+#ifdef __NR_connect
+    if (nr == __NR_connect) return EV_TCP_CONNECT;
+#endif
+#ifdef __NR_execveat
+    if (nr == __NR_execveat) return EV_EXEC;
+#endif
+#ifdef __NR_prctl
+    if (nr == __NR_prctl) {
+        if (a0 == 15) return EV_PRCTL_RENAME;
+        return -1;
+    }
+#endif
+    return -1;
+}
+
+RiskPrediction Tracker::predict_for_syscall(std::uint32_t tgid, int syscall_nr,
+                                            std::uint64_t a0, std::uint64_t a1, std::uint64_t a2) {
+    (void)a1;
+    RiskPrediction rp;
+    std::shared_lock<std::shared_mutex> lk(g_lock_);
+    auto n = lookup_by_pid(tgid);
+    if (n) {
+        rp.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+        rp.current = n->risk_pct;
+        rp.known = true;
+    }
+    if (rep_) rp.exe_path = rep_->resolve_exe(tgid);
+
+    if (!n) {
+        rp.known = false;
+        return rp;
+    }
+
+    int evtype = syscall_to_evtype(syscall_nr, a0, a2);
+    if (evtype < 0) {
+        rp.scores = false;
+        rp.predicted = rp.current;
+        return rp;
+    }
+
+    std::string k = ev_key((std::uint8_t)evtype);
+    double base = MathEng::llr_for(cfg_, k);
+    if (base <= 0.0) {
+        rp.scores = false;
+        rp.predicted = rp.current;
+        return rp;
+    }
+
+    double sim_accum[CAT_COUNT];
+    for (int c = 0; c < CAT_COUNT; c++) sim_accum[c] = n->cat_accum[c];
+
+    double t = now_sec();
+    double dt = t - n->last_score_ts;
+    if (dt > 0.0) {
+        for (int c = 0; c < CAT_COUNT; c++)
+            sim_accum[c] = MathEng::decay_accum(sim_accum[c], dt, cfg_.cats[c].half_life);
+    }
+
+    double mult = 1.0;
+    if (n->owner_uid == 0) mult *= cfg_.ctx_uid0;
+    int cat = ev_category((std::uint8_t)evtype);
+    sim_accum[cat] += base * mult;
+
+    double S = cfg_.prior_logodds;
+    if (!n->is_new) S += cfg_.seeded_prior_extra;
+    int n_active = 0;
+    for (int c = 0; c < CAT_COUNT; c++) {
+        double contrib = MathEng::cat_contrib(sim_accum[c], cfg_.cats[c].max_llr, cfg_.cats[c].scale);
+        S += contrib;
+        if (contrib >= cfg_.active_floor) n_active++;
+    }
+    if (n_active >= 2) S += cfg_.corrob_coeff * (n_active - 1);
+
+    rp.scores = true;
+    rp.predicted = MathEng::sigmoid_stable(S);
+    return rp;
+}
+
+void Tracker::seccomp_persist_hash(std::uint32_t tgid, bool blacklist) {
+    if (!rep_) return;
+    std::string comm, path, hash;
+    {
+        std::shared_lock<std::shared_mutex> lk(g_lock_);
+        auto n = lookup_by_pid(tgid);
+        if (n) comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+        auto hit = tgid_hash_.find(tgid);
+        if (hit != tgid_hash_.end()) hash = hit->second;
+    }
+    path = rep_->resolve_exe(tgid);
+    if (hash.empty()) {
+        bool ok = false;
+        hash = Reputation::hash_of_pid(tgid, ok);
+        if (!ok) hash.clear();
+    }
+    if (comm.empty() && !path.empty()) {
+        std::size_t sl = path.find_last_of('/');
+        comm = (sl == std::string::npos) ? path : path.substr(sl + 1);
+    }
+    if (hash.empty()) {
+        char m[128];
+        std::snprintf(m, sizeof(m), "[SECCOMP] pid=%u hash persist FAILED (no readable exe)", tgid);
+        log_alert(m);
+        return;
+    }
+    std::uint8_t kind = blacklist ? REP_BLACKLIST : REP_WHITELIST;
+    bool ok = rep_->add(kind, hash, comm, path);
+    char m[192];
+    std::snprintf(m, sizeof(m), "[SECCOMP] pid=%u %s -> %s %s",
+                  tgid, comm.c_str(),
+                  blacklist ? "BLACKLIST" : "WHITELIST",
+                  ok ? "persisted" : "FAILED");
+    log_alert(m);
 }
 
 void Tracker::seed_from_proc() {
@@ -247,8 +448,12 @@ std::shared_ptr<ProcNode> Tracker::fork_node(const edr_event &e) {
     double t = ns_to_sec(e.ts_ns);
     n->created_ts = t; n->last_ev_ts = t; n->last_score_ts = t;
     auto par = lookup_by_pid(e.ppid);
-    if (par) { n->parent = par; par->children.push_back(n); }
+    if (par) {
+        n->parent = par; par->children.push_back(n);
+        if (par->supervised || supervised_roots_.count(par->tgid)) n->supervised = true;
+    }
     else roots_.push_back(n);
+    if (supervised_roots_.count(e.tgid)) n->supervised = true;
     nodes_[n->uid] = n;
     pid_to_uid_[e.tgid] = n->uid;
     return n;
@@ -268,8 +473,12 @@ std::shared_ptr<ProcNode> Tracker::ensure_node(const edr_event &e) {
     double t = ns_to_sec(e.ts_ns);
     sn->created_ts = t; sn->last_ev_ts = t; sn->last_score_ts = t;
     auto par = lookup_by_pid(e.ppid);
-    if (par) { sn->parent = par; par->children.push_back(sn); }
+    if (par) {
+        sn->parent = par; par->children.push_back(sn);
+        if (par->supervised || supervised_roots_.count(par->tgid)) sn->supervised = true;
+    }
     else roots_.push_back(sn);
+    if (supervised_roots_.count(e.tgid)) sn->supervised = true;
     nodes_[sn->uid] = sn;
     pid_to_uid_[e.tgid] = sn->uid;
     return sn;
@@ -380,13 +589,14 @@ std::string Tracker::compute_origin(const std::shared_ptr<ProcNode> &n) const {
     return origin;
 }
 
-void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action) {
+void Tracker::enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action, bool burst) {
     PromptReq r;
     r.uid = n->uid; r.pid = n->pid; r.pgid = n->pgid;
     r.comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
     r.origin = compute_origin(n);
     r.doing = action;
     r.risk = n->risk_pct;
+    r.from_burst = burst;
     r.allow_lbl = act_desc(cfg_.allow_action);
     r.deny_lbl = act_desc(cfg_.deny_action);
     r.kill_lbl = act_desc(cfg_.kill_action);
@@ -459,6 +669,50 @@ std::size_t Tracker::blocks_active() const {
     return n;
 }
 
+void Tracker::reblock_from_reputation(const std::string &hash) {
+    std::vector<std::uint32_t> hits;
+    {
+        std::shared_lock<std::shared_mutex> lk(g_lock_);
+        for (auto &kv : tgid_hash_)
+            if (kv.second == hash) hits.push_back(kv.first);
+    }
+    for (auto tg : hits) {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto n = lookup_by_pid(tg);
+        if (n && !n->is_dead && !n->exempt) {
+            arm_block(tg);
+            n->blocked = true;
+            rep_blocks_.fetch_add(1);
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "[REP-BLOCK] pid=%u %s re-blocked (blacklist rule active)",
+                n->pid, n->comm);
+            log_alert(msg);
+        }
+    }
+}
+
+void Tracker::unblock_hash_live(const std::string &hash) {
+    std::vector<std::uint32_t> hits;
+    {
+        std::shared_lock<std::shared_mutex> lk(g_lock_);
+        for (auto &kv : tgid_hash_)
+            if (kv.second == hash) hits.push_back(kv.first);
+    }
+    for (auto tg : hits) {
+        std::unique_lock<std::shared_mutex> lk(g_lock_);
+        auto n = lookup_by_pid(tg);
+        if (n && n->blocked) {
+            disarm_block(tg);
+            n->blocked = false;
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "[REP] pid=%u %s block lifted (rule removed/paused)", n->pid, n->comm);
+            log_alert(msg);
+        }
+    }
+}
+
 void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char decision) {
     if (decision == 'b') {
         std::string comm; std::uint32_t tgid = 0;
@@ -481,6 +735,64 @@ void Tracker::resolve_prompt(const std::string &uid, std::uint32_t pgid, char de
         log_alert(armed
             ? "[BLOCK] " + comm + " resumed; risky syscalls denied in-kernel (LSM)"
             : "[BLOCK] " + comm + " arm FAILED (enforcement unavailable)");
+        return;
+    }
+
+    if (decision == 'd' || decision == 'l') {
+        std::uint8_t kind = (decision == 'd') ? REP_BLACKLIST : REP_WHITELIST;
+        std::string comm, hash, path; std::uint32_t tgid = 0;
+        {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            auto it = nodes_.find(uid);
+            if (it != nodes_.end() && it->second) {
+                auto &n = it->second;
+                comm.assign(n->comm, ::strnlen(n->comm, MAX_COMM));
+                tgid = n->tgid;
+                if (pgid == 0) pgid = n->pgid;
+                n->prompt_pending = false;
+                auto hit = tgid_hash_.find(tgid);
+                if (hit != tgid_hash_.end()) hash = hit->second;
+            }
+        }
+        if (hash.empty() && rep_) {
+            bool ok = false;
+            hash = Reputation::hash_of_pid(tgid, ok);
+            if (!ok) hash.clear();
+        }
+        if (rep_) path = rep_->resolve_exe(tgid);
+        if (comm.empty() && !path.empty()) {
+            std::size_t sl = path.find_last_of('/');
+            comm = (sl == std::string::npos) ? path : path.substr(sl + 1);
+        }
+        bool ok = false;
+        if (rep_ && !hash.empty())
+            ok = rep_->add(kind, hash, comm, path);
+        if (kind == REP_BLACKLIST) {
+            {
+                std::unique_lock<std::shared_mutex> lk(g_lock_);
+                auto it = nodes_.find(uid);
+                if (it != nodes_.end() && it->second) { it->second->frozen = false; it->second->blocked = true; }
+            }
+            arm_block(tgid);
+            if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+            log_alert(ok
+                ? "[BLACKLIST] " + comm + " hash persisted; blocked & resumed"
+                : "[BLACKLIST] " + comm + " FAILED to persist (no exe hash?)");
+        } else {
+            {
+                std::unique_lock<std::shared_mutex> lk(g_lock_);
+                auto it = nodes_.find(uid);
+                if (it != nodes_.end() && it->second) {
+                    it->second->frozen = false; it->second->exempt = true; it->second->blocked = false;
+                    kernel_exempt(it->second->tgid, true);
+                }
+            }
+            disarm_block(tgid);
+            if (pgid > 1 && pgid != own_pgid_) ::kill(-static_cast<pid_t>(pgid), SIGCONT);
+            log_alert(ok
+                ? "[WHITELIST+] " + comm + " hash persisted; exempted & resumed"
+                : "[WHITELIST+] " + comm + " FAILED to persist (no exe hash?)");
+        }
         return;
     }
 
@@ -594,15 +906,64 @@ void Tracker::ingest(const edr_event &e) {
 
     if (e.ev_type == EV_BURST_TRIP) {
         burst_trips_.fetch_add(1);
+        {
+            std::shared_lock<std::shared_mutex> lk(g_lock_);
+            auto sn = lookup_by_pid(e.tgid);
+            if (sn && node_is_supervised(sn)) {
+                return;
+            }
+        }
         double w = (double)e.data.burst.weight_fp / (double)BURST_FP_SCALE;
         char msg[192];
         std::snprintf(msg, sizeof(msg),
             "[BURST] pid=%u %s auto-blocked in-kernel (weight %.1f in window)",
             e.pid, e.comm, w);
         log_alert(msg);
-        std::unique_lock<std::shared_mutex> lk(g_lock_);
-        auto n = lookup_by_pid(e.tgid);
-        if (n) n->blocked = true;
+        std::string hash, path;
+        int verdict;
+        {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            auto n = lookup_by_pid(e.tgid);
+            if (n) n->blocked = true;
+            verdict = reputation_verdict(e.tgid, hash, path);
+        }
+        if (verdict == 1) {
+            char m2[192];
+            std::snprintf(m2, sizeof(m2),
+                "[REP-BLOCK] pid=%u %s matches blacklist hash; block confirmed silently",
+                e.pid, e.comm);
+            log_alert(m2);
+            rep_blocks_.fetch_add(1);
+            return;
+        }
+        if (verdict == -1) {
+            disarm_block(e.tgid);
+            {
+                std::unique_lock<std::shared_mutex> lk(g_lock_);
+                auto n = lookup_by_pid(e.tgid);
+                if (n) { n->blocked = false; n->exempt = true; kernel_exempt(n->tgid, true); }
+            }
+            char m2[192];
+            std::snprintf(m2, sizeof(m2),
+                "[REP-ALLOW] pid=%u %s matches whitelist hash; burst block lifted",
+                e.pid, e.comm);
+            log_alert(m2);
+            return;
+        }
+        std::shared_ptr<ProcNode> n;
+        {
+            std::unique_lock<std::shared_mutex> lk(g_lock_);
+            n = lookup_by_pid(e.tgid);
+        }
+        if (n && cfg_.prompt_enabled && !n->prompt_pending) {
+            std::uint32_t pg = n->pgid;
+            if (pg > 1 && pg != own_pgid_) {
+                ::kill(-static_cast<pid_t>(pg), SIGSTOP);
+                std::unique_lock<std::shared_mutex> lk(g_lock_);
+                n->frozen = true; n->prompt_pending = true;
+                enqueue_prompt(n, "trip a burst of risky syscalls (auto-blocked)", true);
+            }
+        }
         return;
     }
 
@@ -638,15 +999,43 @@ void Tracker::ingest(const edr_event &e) {
             if (wit != watchlist_.end()) wit->second.is_dead = true;
             if (n->blocked) { n->blocked = false; disarm_block(n->tgid); }
             kernel_exempt(n->tgid, false);
+            tgid_hash_.erase(n->tgid);
+            supervised_roots_.erase(n->tgid);
         }
         return;
     } else {
         n = ensure_node(e);
         if (n && e.pgid > 0) n->pgid = e.pgid;
+        bool supervised = node_is_supervised(n);
         if (n && e.ev_type == EV_EXEC) {
             std::memcpy(n->comm, e.comm, MAX_COMM);
             n->exempt = self_pid(n->pid, n->pgid) || is_exempt_comm(n->comm);
+            // if (supervised) n->exempt = false;
             kernel_exempt(n->tgid, n->exempt);
+            tgid_hash_.erase(n->tgid);
+            if (!n->exempt && !supervised && !n->rep_checked) {
+                n->rep_checked = true;
+                std::string hash, path;
+                int verdict = reputation_verdict(n->tgid, hash, path);
+                if (verdict == 1) {
+                    arm_block(n->tgid);
+                    n->blocked = true;
+                    rep_blocks_.fetch_add(1);
+                    char msg[192];
+                    std::snprintf(msg, sizeof(msg),
+                        "[REP-BLOCK] pid=%u %s known-bad hash on exec; blocked silently",
+                        n->pid, n->comm);
+                    log_alert(msg);
+                } else if (verdict == -1) {
+                    n->exempt = true;
+                    kernel_exempt(n->tgid, true);
+                    char msg[192];
+                    std::snprintf(msg, sizeof(msg),
+                        "[REP-ALLOW] pid=%u %s known-good hash on exec; exempted silently",
+                        n->pid, n->comm);
+                    log_alert(msg);
+                }
+            }
         }
         if (n && e.ev_type == EV_PRCTL_RENAME && !n->exempt) {
             char nn[MAX_COMM] = {0};
@@ -671,7 +1060,9 @@ void Tracker::ingest(const edr_event &e) {
     add_evidence(n, cat, amount, t);
     backprop(n, cat, amount, 0, now_sec());
 
-    if (base >= 1.5) {
+    bool supervised = node_is_supervised(n);
+
+    if (base >= 1.5 && !supervised) {
         char msg[192];
         std::snprintf(msg, sizeof(msg), "[%u] %s %s llr=%.2f risk=%.1f%% st=%s",
             n->pid, n->comm, k.c_str(), amount, n->risk_pct * 100.0,
@@ -681,7 +1072,7 @@ void Tracker::ingest(const edr_event &e) {
 
     double tw = now_sec();
     bool warm = (tw - start_ts_) >= cfg_.warmup_sec;
-    if (cfg_.prompt_enabled && warm && !n->prompt_pending
+    if (!supervised && cfg_.prompt_enabled && warm && !n->prompt_pending
         && base >= cfg_.prompt_event_floor
         && n->risk_pct >= cfg_.prompt_threshold) {
         std::uint32_t pg = n->pgid;
@@ -689,7 +1080,7 @@ void Tracker::ingest(const edr_event &e) {
             ::kill(-static_cast<pid_t>(pg), SIGSTOP);
             n->frozen = true;
             n->prompt_pending = true;
-            enqueue_prompt(n, ev_action_desc(e.ev_type));
+            enqueue_prompt(n, ev_action_desc(e.ev_type), false);
             char fm[160];
             std::snprintf(fm, sizeof(fm), "[FREEZE] pid=%u %s suspended at %.0f%% pending decision",
                           n->pid, n->comm, n->risk_pct * 100.0);
@@ -700,6 +1091,7 @@ void Tracker::ingest(const edr_event &e) {
 
 void Tracker::mitigate(std::shared_ptr<ProcNode> n) {
     if (!n || n->exempt || n->kill_flagged) return;
+    if (node_is_supervised(n)) return;
     std::uint32_t pgid = n->pgid;
     if (pgid <= 1) return;
     if (pgid == own_pgid_) return;
@@ -754,10 +1146,13 @@ void Tracker::gc_sweep(double now_s) {
         auto it = nodes_.find(u);
         if (it == nodes_.end()) continue;
         detach_from_parent(it->second);
+        std::uint32_t dt = it->second->tgid;
         for (auto pit = pid_to_uid_.begin(); pit != pid_to_uid_.end(); ) {
             if (pit->second == u) pit = pid_to_uid_.erase(pit);
             else ++pit;
         }
+        tgid_hash_.erase(dt);
+        supervised_roots_.erase(dt);
         nodes_.erase(it);
     }
 }
@@ -791,6 +1186,7 @@ void Tracker::tick() {
             if (!n || n->exempt || n->frozen) continue;
             if (!n->is_dead) update_watchlist(n);
             if (n->is_dead) continue;
+            if (node_is_supervised(n)) { n->above_since = 0.0; continue; }
             if (n->risk_pct >= cfg_.kill_threshold) {
                 if (n->above_since <= 0.0) n->above_since = t;
                 if (warm && (t - n->above_since) >= cfg_.dwell_sec)
@@ -815,6 +1211,7 @@ SnapNode Tracker::build_snap(const std::shared_ptr<ProcNode> &n) const {
     s.exempt = n->exempt;
     s.frozen = n->frozen;
     s.blocked = n->blocked;
+    s.supervised = n->supervised || (bool)supervised_roots_.count(n->tgid);
     for (auto &c : n->children) if (c) s.children.push_back(build_snap(c));
     return s;
 }
@@ -848,6 +1245,8 @@ Snapshot Tracker::snapshot() const {
         if (!kv.second->is_dead) s.live_nodes++;
         if (kv.second->is_new && !kv.second->is_dead && !kv.second->exempt) s.new_nodes++;
         if (kv.second->frozen) s.frozen_count++;
+        if ((kv.second->supervised || supervised_roots_.count(kv.second->tgid)) && !kv.second->is_dead)
+            s.supervised_count++;
     }
     std::size_t mn = std::min<std::size_t>(8, masq_events_.size());
     for (std::size_t i = masq_events_.size() - mn; i < masq_events_.size(); i++)
@@ -870,3 +1269,22 @@ std::vector<std::string> Tracker::tail_alerts(std::size_t n) const {
 
 void Tracker::push_alert(const std::string &s) { log_alert(s); }
 void Tracker::stop() { running_.store(false); }
+
+int Tracker::reputation_verdict(std::uint32_t tgid, std::string &hash_out,
+                                std::string &path_out) {
+    if (!rep_) return 0;
+    auto hit = tgid_hash_.find(tgid);
+    if (hit != tgid_hash_.end()) {
+        hash_out = hit->second;
+    } else {
+        bool ok = false;
+        std::string h = Reputation::hash_of_pid(tgid, ok);
+        if (!ok || h.empty()) return 0;
+        hash_out = h;
+        tgid_hash_[tgid] = h;
+    }
+    path_out = rep_->resolve_exe(tgid);
+    if (rep_->is_whitelisted(hash_out)) return -1;
+    if (rep_->is_blacklisted(hash_out)) return 1;
+    return 0;
+}

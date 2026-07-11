@@ -36,7 +36,7 @@ apt-get update -qq
 log "apt upgrade (keeping toolchain + kernel headers current)"
 apt-get upgrade -y --no-install-recommends || warn "apt upgrade reported issues; continuing"
 
-BASE_PKGS="build-essential clang llvm libbpf-dev cmake pkg-config zlib1g-dev libelf-dev git wget ca-certificates libcap-dev"
+BASE_PKGS="build-essential clang llvm libbpf-dev cmake pkg-config zlib1g-dev libelf-dev git wget ca-certificates libcap-dev e2fsprogs"
 
 log "installing base toolchain"
 apt-get install -y --no-install-recommends $BASE_PKGS
@@ -134,6 +134,35 @@ if [ ! -d /sys/kernel/tracing/events/sched ]; then
         warn "auto-mount failed; run manually: sudo mount -t tracefs nodev /sys/kernel/tracing"
     fi
 fi
+
+log "preparing reputation store /etc/edr"
+mkdir -p /etc/edr
+chmod 0700 /etc/edr 2>/dev/null || true
+
+# clear immutable bit first — a prior run may have set it, which blocks chmod/write
+if [ -f /etc/edr/reputation.json ] && command -v chattr >/dev/null 2>&1; then
+    chattr -i /etc/edr/reputation.json 2>/dev/null || true
+fi
+
+if [ ! -f /etc/edr/reputation.json ]; then
+    printf '{\n  "version": 1,\n  "checksum": "%s",\n  "entries": []\n}\n' \
+        "$(printf '' | sha256sum | cut -d' ' -f1)" > /etc/edr/reputation.json
+    log "seeded empty reputation store"
+else
+    log "reputation store already exists; leaving contents intact"
+fi
+chmod 0600 /etc/edr/reputation.json 2>/dev/null || warn "chmod on reputation.json failed (non-fatal)"
+
+if command -v chattr >/dev/null 2>&1; then
+    chattr +i /etc/edr/reputation.json 2>/dev/null \
+        && log "reputation store set immutable (chattr +i)" \
+        || warn "chattr +i failed (fs may not support it); store remains 0600 root-only"
+else
+    warn "chattr unavailable; reputation store is 0600 root-only but not immutable"
+fi
+warn "reputation store protection: 0600 + immutable stops non-root entirely and forces"
+warn "an explicit 'chattr -i' before any root tampering. It is NOT tamper-PROOF against a"
+warn "determined root attacker. TPM/remote-log sealing is out of scope for this build."
 
 mkdir -p include external build
 

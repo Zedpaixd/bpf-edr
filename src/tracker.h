@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "math_engine.h"
+#include "reputation.h"
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -12,6 +13,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 struct ProcNode {
@@ -41,6 +43,8 @@ struct ProcNode {
     bool   frozen = false;
     bool   prompt_pending = false;
     bool   blocked = false;
+    bool   rep_checked = false;
+    bool   supervised = false;
     std::weak_ptr<ProcNode> parent;
     std::vector<std::shared_ptr<ProcNode>> children;
 };
@@ -55,6 +59,7 @@ struct SnapNode {
     bool          exempt = false;
     bool          frozen = false;
     bool          blocked = false;
+    bool          supervised = false;
     std::vector<SnapNode> children;
 };
 
@@ -99,6 +104,7 @@ struct PromptReq {
     std::string   deny_lbl;
     std::string   kill_lbl;
     std::string   wl_lbl;
+    bool          from_burst = false;
 };
 
 struct Snapshot {
@@ -111,11 +117,22 @@ struct Snapshot {
     std::size_t new_nodes = 0;
     std::size_t watch_count = 0;
     std::size_t frozen_count = 0;
+    std::size_t supervised_count = 0;
+};
+
+struct RiskPrediction {
+    bool known = false;
+    bool scores = false;
+    double current = -1.0;
+    double predicted = -1.0;
+    std::string comm;
+    std::string exe_path;
 };
 
 class Tracker {
 public:
-    Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid);
+    Tracker(EngineCfg cfg, std::uint32_t own_pgid, std::uint32_t own_pid,
+            std::shared_ptr<Reputation> rep);
     void seed_from_proc();
     void ingest(const edr_event &e);
     void tick();
@@ -139,16 +156,29 @@ public:
     bool enforcement_on() const { return enforce_on_.load(); }
     std::uint64_t denies() const { return denies_.load(); }
     std::uint64_t burst_trips() const { return burst_trips_.load(); }
+    std::uint64_t rep_blocks() const { return rep_blocks_.load(); }
     std::size_t blocks_active() const;
+    std::shared_ptr<Reputation> reputation() const { return rep_; }
+    void reblock_from_reputation(const std::string &hash);
+    void unblock_hash_live(const std::string &hash);
+
+    void register_supervised(std::uint32_t tgid);
+    void unregister_supervised(std::uint32_t tgid);
+    RiskPrediction predict_for_syscall(std::uint32_t tgid, int syscall_nr,
+                                       std::uint64_t a0, std::uint64_t a1, std::uint64_t a2);
+    void seccomp_persist_hash(std::uint32_t tgid, bool blacklist);
 
 private:
     EngineCfg cfg_;
     std::uint32_t own_pgid_;
     std::uint32_t own_pid_;
+    std::shared_ptr<Reputation> rep_;
     double start_ts_ = 0.0;
     mutable std::shared_mutex g_lock_;
     std::unordered_map<std::string, std::shared_ptr<ProcNode>> nodes_;
     std::unordered_map<std::uint32_t, std::string> pid_to_uid_;
+    std::unordered_map<std::uint32_t, std::string> tgid_hash_;
+    std::unordered_set<std::uint32_t> supervised_roots_;
     std::vector<std::shared_ptr<ProcNode>> roots_;
     std::deque<MasqEvent> masq_events_;
     std::unordered_map<std::string, WatchEntry> watchlist_;
@@ -169,16 +199,19 @@ private:
     std::atomic<bool> enforce_on_{true};
     std::atomic<std::uint64_t> denies_{0};
     std::atomic<std::uint64_t> burst_trips_{0};
+    std::atomic<std::uint64_t> rep_blocks_{0};
 
     std::string mk_uid(std::uint32_t tgid, std::uint64_t ts_ns) const;
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
     std::shared_ptr<ProcNode> ensure_node(const edr_event &e);
     std::shared_ptr<ProcNode> fork_node(const edr_event &e);
+    bool synth_node_from_proc(std::uint32_t tgid);
     std::string ev_key(std::uint8_t t) const;
     bool self_pid(std::uint32_t pid, std::uint32_t pgid) const;
     bool is_self(const edr_event &e) const;
     bool is_exempt_comm(const char *nm) const;
     bool is_masq_name(const char *nm) const;
+    bool node_is_supervised(const std::shared_ptr<ProcNode> &n) const;
     double ctx_mult(const edr_event &e, const std::shared_ptr<ProcNode> &n) const;
     void decay_to(const std::shared_ptr<ProcNode> &n, double now);
     void recompute(const std::shared_ptr<ProcNode> &n);
@@ -188,7 +221,7 @@ private:
     void recompute_badges();
     std::string active_stages(const std::shared_ptr<ProcNode> &n) const;
     std::string compute_origin(const std::shared_ptr<ProcNode> &n) const;
-    void enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action);
+    void enqueue_prompt(const std::shared_ptr<ProcNode> &n, const std::string &action, bool burst);
     void update_watchlist(const std::shared_ptr<ProcNode> &n);
     void log_masquerade(const std::shared_ptr<ProcNode> &n, const char *new_name, bool susp);
     void log_alert(const std::string &s);
@@ -200,6 +233,8 @@ private:
     bool arm_block(std::uint32_t tgid);
     void disarm_block(std::uint32_t tgid);
     void kernel_exempt(std::uint32_t tgid, bool on);
+    int reputation_verdict(std::uint32_t tgid, std::string &hash_out, std::string &path_out);
+    int syscall_to_evtype(int nr, std::uint64_t a0, std::uint64_t a2) const;
 };
 
 #endif

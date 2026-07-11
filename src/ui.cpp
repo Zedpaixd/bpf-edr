@@ -1,5 +1,8 @@
 #include "ui.h"
+#include "ui_common.h"
+#include "seccomp_filter.h"
 #include <ftxui/component/component.hpp>
+#include <ftxui/component/component_base.hpp>
 #include <ftxui/component/event.hpp>
 #include <ftxui/component/mouse.hpp>
 #include <ftxui/component/screen_interactive.hpp>
@@ -9,11 +12,18 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 
 using namespace ftxui;
+using uic::risk_color;
+using uic::fmt_pct;
+using uic::hclip;
+using uic::wrap_indent;
+
+enum ActiveModal { AM_NONE = 0, AM_SECCOMP, AM_EBPF, AM_REPMAN, AM_LAUNCH, AM_SUPOUT };
 
 struct FlatRow {
     int depth;
@@ -27,64 +37,24 @@ struct FlatRow {
     bool exempt;
     bool frozen;
     bool blocked;
+    bool supervised;
 };
 
-Ui::Ui(std::shared_ptr<Tracker> t) : tr_(std::move(t)) {}
+Ui::Ui(std::shared_ptr<Tracker> t, std::shared_ptr<SeccompSupervisor> sup, Keymap km)
+    : tr_(std::move(t)), sup_(std::move(sup)), km_(std::move(km)) {}
 void Ui::stop() { stop_.store(true); }
-
-static Color risk_color(double r) {
-    if (r < 0.20) return Color::Green;
-    if (r < 0.75) return Color::Yellow;
-    return Color::Red;
-}
-static std::string fmt_pct(double r) {
-    char b[16];
-    std::snprintf(b, sizeof(b), "%5.1f%%", r * 100.0);
-    return b;
-}
-static std::string hclip(const std::string &s, int off) {
-    if (off <= 0) return s;
-    if ((std::size_t)off >= s.size()) return std::string();
-    return s.substr((std::size_t)off);
-}
-
-static Element wrap_indent(const std::string &s, int width, int indent, Color c, bool bold_on) {
-    if (width < 8) width = 8;
-    if (indent < 0) indent = 0;
-    if (indent > width - 4) indent = width - 4;
-    Elements lines;
-    std::string pad(indent, ' ');
-    std::size_t pos = 0;
-    bool first = true;
-    while (pos < s.size()) {
-        int avail = first ? width : (width - indent);
-        if (avail < 1) avail = 1;
-        std::string chunk = s.substr(pos, (std::size_t)avail);
-        pos += chunk.size();
-        std::string full = first ? chunk : (pad + chunk);
-        Element e = text(full) | color(c);
-        if (bold_on) e = e | bold;
-        lines.push_back(e);
-        first = false;
-    }
-    if (lines.empty()) {
-        Element e = text("") | color(c);
-        lines.push_back(e);
-    }
-    return vbox(std::move(lines));
-}
 
 static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
                           bool anchor_used, std::vector<FlatRow> &out) {
     if (!n.exempt) {
         out.push_back({depth, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, n.is_new, false, false, n.frozen, n.blocked});
+                       n.is_dead, n.is_new, false, false, n.frozen, n.blocked, n.supervised});
         for (auto &c : n.children) collapse_walk(c, depth + 1, false, anchor_used, out);
     } else {
         bool anchor = (!anchor_used && !parent_exempt);
         if (anchor) {
             out.push_back({depth, n.pid, n.comm, n.risk_pct, 0.0,
-                           n.is_dead, n.is_new, true, true, false, false});
+                           n.is_dead, n.is_new, true, true, false, false, n.supervised});
             for (auto &c : n.children) collapse_walk(c, depth + 1, true, true, out);
         } else {
             for (auto &c : n.children) collapse_walk(c, depth, true, anchor_used, out);
@@ -95,7 +65,7 @@ static void collapse_walk(const SnapNode &n, int depth, bool parent_exempt,
 static void newonly_walk(const SnapNode &n, std::vector<FlatRow> &out) {
     if (n.is_new && !n.exempt)
         out.push_back({0, n.pid, n.comm, n.risk_pct, n.badge_risk,
-                       n.is_dead, true, false, false, n.frozen, n.blocked});
+                       n.is_dead, true, false, false, n.frozen, n.blocked, n.supervised});
     for (auto &c : n.children) newonly_walk(c, out);
 }
 
@@ -111,12 +81,14 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
     prefix += r.is_new ? "* " : "  ";
     std::string label = prefix + "[" + std::to_string(r.pid) + "] " + r.comm
                         + " - " + fmt_pct(r.risk_pct);
-    if (r.blocked) label += " (BLOCKED)";
+    if (r.supervised) label += " (WATCHED)";
+    else if (r.blocked) label += " (BLOCKED)";
     else if (r.frozen) label += " (FROZEN)";
     else if (r.is_dead) label += " (dead)";
     if (r.is_anchor) label += "  <shell>";
     Color c;
-    if (r.blocked)        c = Color::Magenta;
+    if (r.supervised)     c = Color::CyanLight;
+    else if (r.blocked)   c = Color::Magenta;
     else if (r.frozen)    c = Color::Cyan;
     else if (r.is_dead)   c = r.risk_pct >= 0.20 ? Color::Red : Color::GrayDark;
     else if (r.is_anchor) c = Color::GrayDark;
@@ -125,7 +97,7 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
 
     Elements parts;
     Element base = text(hclip(label, hoff)) | color(c);
-    if (r.frozen || r.blocked) base = base | bold;
+    if (r.frozen || r.blocked || r.supervised) base = base | bold;
     parts.push_back(base);
     if (r.badge_risk > 0.05) {
         std::string chip = " sub " + fmt_pct(r.badge_risk) + " ";
@@ -138,25 +110,42 @@ static Element make_row(const FlatRow &r, bool selected, int hoff) {
     return el;
 }
 
-static Element build_tree_pane(const Snapshot &snap, int &sel, bool new_only, int hoff) {
+static Element build_legend() {
+    auto sw = [](const char *lbl, Color c) {
+        return hbox({ text(" \u25A0 ") | color(c), text(lbl) | color(Color::GrayLight) });
+    };
+    return window(text(" Legend ") | bold,
+        vbox({
+            hbox({ sw("low <20%", Color::Green), sw("med", Color::Yellow), sw("high >75%", Color::Red) }),
+            hbox({ sw("watched(seccomp)", Color::CyanLight), sw("blocked", Color::Magenta), sw("frozen", Color::Cyan) }),
+            hbox({ sw("exempt/trusted", Color::GrayLight), sw("dead", Color::GrayDark) }),
+            text(" * = new process   sub = riskiest child   [pid] comm - risk%") | dim,
+        }));
+}
+
+static Element build_tree_pane(const Snapshot &snap, int &sel, bool new_only, int hoff, bool focused) {
     std::vector<FlatRow> rows = build_flat(snap, new_only);
+    std::string title = focused ? " Lineage & State  [FOCUSED] " : " Lineage & State ";
     if (rows.empty()) {
-        return window(text(" Lineage & State ") | bold,
+        Element w = window(text(title) | bold,
                       vbox({ text(" (no processes match filter) ") | dim | center | flex }));
+        return focused ? (w | color(Color::White)) : w;
     }
     if (sel < 0) sel = 0;
     if (sel >= (int)rows.size()) sel = (int)rows.size() - 1;
     Elements list;
     list.reserve(rows.size());
-    for (int i = 0; i < (int)rows.size(); i++) list.push_back(make_row(rows[i], i == sel, hoff));
-    char meta[224];
+    for (int i = 0; i < (int)rows.size(); i++) list.push_back(make_row(rows[i], i == sel && focused, hoff));
+    char meta[240];
     std::snprintf(meta, sizeof(meta),
-        " %s | row %d/%zu | live=%zu new=%zu frozen=%zu | H%+d ",
+        " %s | row %d/%zu | live=%zu new=%zu frozen=%zu watched=%zu ",
         new_only ? "NEW ONLY (a: all)" : "ALL (n: new only)",
-        sel + 1, rows.size(), snap.live_nodes, snap.new_nodes, snap.frozen_count, hoff);
-    return window(text(" Lineage & State ") | bold,
+        sel + 1, rows.size(), snap.live_nodes, snap.new_nodes,
+        snap.frozen_count, snap.supervised_count);
+    Element w = window(text(title) | bold,
                   vbox({ text(meta) | dim, separator(),
                          vbox(std::move(list)) | vscroll_indicator | yframe | flex }));
+    return focused ? (w | color(Color::White)) : w;
 }
 
 static Element build_gauges_pane(const Snapshot &snap, int width) {
@@ -174,13 +163,13 @@ static Element build_gauges_pane(const Snapshot &snap, int width) {
             g.push_back(gauge(0.0f) | color(Color::GrayDark));
         }
     }
-    return window(text(" Threat Gauges (own risk) ") | bold, vbox(std::move(g)));
+    return window(text(" Threat Gauges (highest live risk) ") | bold, vbox(std::move(g)));
 }
 
 static Element build_watchlist_pane(const Snapshot &snap, int width) {
     Elements w;
     if (snap.watchlist.empty()) {
-        w.push_back(text(" (empty; flags at peak >= 40%) ") | dim);
+        w.push_back(text(" (empty; a process is listed once its risk peaks >= 40%) ") | dim);
     } else {
         std::size_t limit = std::min<std::size_t>(8, snap.watchlist.size());
         for (std::size_t i = 0; i < limit; i++) {
@@ -189,47 +178,53 @@ static Element build_watchlist_pane(const Snapshot &snap, int width) {
             std::string head = e.first_tstr + (e.is_dead ? " x " : "   ")
                 + "[" + std::to_string(e.pid) + "] ";
             std::string body = e.comm + " from:" + org
-                + " pk=" + fmt_pct(e.peak_risk_pct)
-                + " cur=" + fmt_pct(e.current_risk_pct)
-                + " ch=" + std::to_string(e.child_count)
-                + " st=" + (e.stages.empty() ? std::string("-") : e.stages);
+                + " peak=" + fmt_pct(e.peak_risk_pct)
+                + " now=" + fmt_pct(e.current_risk_pct)
+                + " kids=" + std::to_string(e.child_count)
+                + " stages=" + (e.stages.empty() ? std::string("-") : e.stages);
             Color c = e.is_dead ? Color::GrayDark : risk_color(e.peak_risk_pct);
             int indent = (int)head.size();
             w.push_back(wrap_indent(head + body, width, indent, c, false));
         }
     }
-    return window(text(" Watchlist [first | from:launcher | L/X/M/P/E/C] ") | bold,
+    return window(text(" Watchlist [time | from:launcher | stages L/X/M/P/E/C] ") | bold,
                   vbox(std::move(w)) | vscroll_indicator | yframe);
 }
 
 static Element build_masq_pane(const Snapshot &snap, int width) {
     Elements m;
     if (snap.masq_events.empty()) {
-        m.push_back(text(" (no renames observed) ") | dim);
+        m.push_back(text(" (no process-rename events seen) ") | dim);
     } else {
         for (auto &e : snap.masq_events) {
             std::string head = e.tstr + " [" + std::to_string(e.pid) + "] ";
             std::string body = "'" + e.old_comm + "' -> '" + e.new_comm + "'"
-                + (e.suspicious ? " [!]" : "");
+                + (e.suspicious ? "  (suspicious!)" : "");
             Color c = e.suspicious ? Color::Magenta : Color::GrayLight;
             int indent = (int)head.size();
             m.push_back(wrap_indent(head + body, width, indent, c, e.suspicious));
         }
     }
-    return window(text(" Rename / Masquerade Log ") | bold,
+    return window(text(" Process Rename / Masquerade Log ") | bold,
                   vbox(std::move(m)) | vscroll_indicator | yframe);
 }
 
 static Element build_audit_pane(const std::vector<std::string> &lines, int width, int roff) {
     Elements a;
     if (lines.empty()) {
-        a.push_back(text(" (no alerts) ") | dim);
+        a.push_back(text(" (no alerts yet) ") | dim);
     } else {
         for (auto &s : lines) {
             Color c = Color::Yellow;
-            if (s.find("[BURST]") != std::string::npos) c = Color::Red;
+            if (s.find("[SECCOMP]") != std::string::npos) c = Color::CyanLight;
+            else if (s.find("[BURST]") != std::string::npos) c = Color::Red;
+            else if (s.find("REP-BLOCK") != std::string::npos) c = Color::Red;
+            else if (s.find("REP-ALLOW") != std::string::npos) c = Color::Green;
+            else if (s.find("[BLACKLIST]") != std::string::npos) c = Color::Red;
+            else if (s.find("[WHITELIST+]") != std::string::npos) c = Color::Green;
             else if (s.find("LSM-DENY") != std::string::npos) c = Color::Magenta;
             else if (s.find("[BLOCK]") != std::string::npos) c = Color::Magenta;
+            else if (s.find("[REP]") != std::string::npos) c = Color::Cyan;
             else if (s.find("[LSM]") != std::string::npos) c = Color::Cyan;
             else if (s.find("KILL") != std::string::npos) c = Color::Red;
             else if (s.find("FREEZE") != std::string::npos) c = Color::Cyan;
@@ -244,35 +239,188 @@ static Element build_audit_pane(const std::vector<std::string> &lines, int width
         }
     }
     char title[64];
-    std::snprintf(title, sizeof(title), " Audit Log %s ", roff > 0 ? "(history)" : "(live)");
+    std::snprintf(title, sizeof(title), " Audit Log %s (scroll: wheel) ", roff > 0 ? "[history]" : "[live]");
     return window(text(title) | bold, vbox(std::move(a)));
 }
 
-static Element build_modal(const PromptReq &p, int width) {
-    std::string org = (p.origin == p.comm) ? std::string() : ("  (from: " + p.origin + ")");
+static Element kv_line(const char *k, const std::string &v, Color vc) {
+    return hbox({ text(std::string("  ") + k) | color(Color::GrayLight),
+                  text(v) | color(vc) | bold });
+}
+
+static Element build_ebpf_modal(const PromptReq &p, const Keymap &km, int width) {
+    std::string org = (p.origin == p.comm) ? std::string() : (" (from " + p.origin + ")");
     int inner = width - 6;
-    if (inner < 20) inner = 20;
+    if (inner < 24) inner = 24;
+    std::string banner = p.from_burst
+        ? "  BURST AUTO-BLOCKED — CONFIRM OR OVERRIDE  "
+        : "  eBPF THREAT — PROCESS SUSPENDED  ";
     Elements v;
-    v.push_back(text("  THREAT FROZEN - AWAITING DECISION  ") | bold | color(Color::Black) | bgcolor(Color::Red) | center);
+    v.push_back(text(banner) | bold | color(Color::Black) | bgcolor(Color::Red) | center);
     v.push_back(text(""));
-    v.push_back(wrap_indent("  Process : [" + std::to_string(p.pid) + "] " + p.comm + org,
-                            inner, 12, Color::White, true));
-    char l2[64];
-    std::snprintf(l2, sizeof(l2), "  Risk    : %.1f%%", p.risk * 100.0);
-    v.push_back(text(l2) | color(Color::Red) | bold);
-    v.push_back(wrap_indent("  Flagged : it tried to " + p.doing, inner, 12, Color::Yellow, false));
-    v.push_back(text("            (this action ran; process now suspended before the next)") | dim);
+    v.push_back(wrap_indent("Process: [" + std::to_string(p.pid) + "] " + p.comm + org,
+                            inner, 9, Color::White, true));
+    v.push_back(kv_line("Risk:    ", fmt_pct(p.risk), risk_color(p.risk)));
+    v.push_back(wrap_indent("Reason:  it tried to " + p.doing, inner, 9, Color::Yellow, false));
+    if (p.from_burst)
+        v.push_back(text("           kernel already blocked it; your choice overrides") | dim);
+    else
+        v.push_back(text("           that action ran; it is suspended before the next one") | dim);
     v.push_back(text(""));
     v.push_back(separator());
-    v.push_back(wrap_indent("  [Y] allow -> " + p.allow_lbl, inner, 14, Color::Green, false));
-    v.push_back(wrap_indent("  [N] deny  -> " + p.deny_lbl, inner, 14, Color::Yellow, false));
-    v.push_back(text("  [B] block -> resume; deny risky syscalls in-kernel (LSM)") | color(Color::Magenta));
-    v.push_back(wrap_indent("  [K] kill  -> " + p.kill_lbl, inner, 14, Color::Red, false));
-    v.push_back(wrap_indent("  [W] w-list-> " + p.wl_lbl, inner, 14, Color::Cyan, false));
-    v.push_back(text("  [Esc] dismiss (leave suspended, no action) ") | dim);
-    return window(text(" THREAT CONFIRMATION ") | bold | color(Color::Red),
+    v.push_back(text(" WHAT DO YOU WANT TO DO?") | bold | color(Color::White));
+    auto opt = [&](KmAction a, const char *desc, Color c) {
+        return hbox({ text("  [" + km.key_for(a) + "] ") | color(c) | bold,
+                      text(desc) | color(Color::GrayLight) });
+    };
+    v.push_back(opt(KM_ALLOW, "Allow — let it continue running", Color::Green));
+    v.push_back(opt(KM_DENY, "Deny — keep it suspended, do nothing", Color::Yellow));
+    v.push_back(opt(KM_BLOCK, "Block — resume, but deny its risky syscalls (kernel)", Color::Magenta));
+    v.push_back(opt(KM_KILL, "Kill — terminate the whole process group", Color::Red));
+    v.push_back(separator());
+    v.push_back(text(" REMEMBER THIS BINARY (by hash, saved to disk):") | bold | color(Color::White));
+    v.push_back(opt(KM_BLACKLIST, "Blacklist — always auto-block this binary in future", Color::Red));
+    v.push_back(opt(KM_WHITELIST, "Whitelist — always trust this binary in future", Color::Green));
+    v.push_back(opt(KM_SESSION_WL, "Session-allow — trust only until EDR restarts", Color::Cyan));
+    v.push_back(text("  [Esc] Dismiss (leave it suspended, decide later)") | dim);
+    return window(text(" DECISION REQUIRED ") | bold | color(Color::Red),
                   vbox(std::move(v)))
            | size(WIDTH, EQUAL, width) | bgcolor(Color::Black) | clear_under;
+}
+
+static Element build_seccomp_modal(const SeccompPrompt &p, const Keymap &km, int width) {
+    int inner = width - 6;
+    if (inner < 24) inner = 24;
+    Elements v;
+    v.push_back(text("  SUPERVISED SYSCALL — FROZEN IN KERNEL  ")
+                | bold | color(Color::Black) | bgcolor(Color::CyanLight) | center);
+    v.push_back(text(""));
+    v.push_back(wrap_indent("Process: [" + std::to_string(p.pid) + "] "
+                            + (p.comm.empty() ? std::string("?") : p.comm),
+                            inner, 9, Color::White, true));
+    if (!p.exe_path.empty())
+        v.push_back(wrap_indent("Path:    " + p.exe_path, inner, 9, Color::GrayLight, false));
+    v.push_back(wrap_indent("Syscall: " + p.syscall_label, inner, 9, Color::CyanLight, true));
+    char args[96];
+    std::snprintf(args, sizeof(args), "arg0=0x%llx arg1=0x%llx arg2=0x%llx",
+                  (unsigned long long)p.args[0], (unsigned long long)p.args[1],
+                  (unsigned long long)p.args[2]);
+    v.push_back(wrap_indent(std::string("Args:    ") + args, inner, 9, Color::GrayLight, false));
+    v.push_back(text(""));
+
+    std::string riskline;
+    Color rc = Color::GrayLight;
+    if (!p.risk_known) {
+        riskline = "eBPF confidence: — (process not yet in eBPF model)";
+    } else if (p.scores_ebpf) {
+        riskline = "eBPF confidence: " + fmt_pct(p.risk_current)
+                 + "  ->  " + fmt_pct(p.risk_predicted) + " if allowed";
+        rc = risk_color(p.risk_predicted);
+    } else {
+        riskline = "eBPF confidence: " + fmt_pct(p.risk_current)
+                 + "  ->  " + fmt_pct(p.risk_current)
+                 + "  | Unmonitored syscall";
+        rc = risk_color(p.risk_current);
+    }
+    v.push_back(wrap_indent(riskline, inner, 0, rc, true));
+    v.push_back(text("  (this syscall cannot proceed until you decide — it is held in-kernel)") | dim);
+    v.push_back(text(""));
+    v.push_back(separator());
+    v.push_back(text(" ALLOW THIS SYSCALL TO RUN?") | bold | color(Color::White));
+    auto opt = [&](KmAction a, const char *desc, Color c) {
+        return hbox({ text("  [" + km.key_for(a) + "] ") | color(c) | bold,
+                      text(desc) | color(Color::GrayLight) });
+    };
+    v.push_back(opt(KM_ALLOW, "Allow — the syscall proceeds normally", Color::Green));
+    v.push_back(opt(KM_DENY, "Deny — the syscall returns EPERM (it fails)", Color::Yellow));
+    v.push_back(opt(KM_KILL, "Kill — deny and terminate the process", Color::Red));
+    v.push_back(separator());
+    v.push_back(text(" REMEMBER THIS BINARY (by hash, saved to disk):") | bold | color(Color::White));
+    v.push_back(opt(KM_BLACKLIST, "Blacklist — deny now; auto-block system-wide in future", Color::Red));
+    v.push_back(opt(KM_WHITELIST, "Whitelist — allow now; auto-trust system-wide in future", Color::Green));
+    return window(text(" SUPERVISED — DECISION REQUIRED ") | bold | color(Color::CyanLight),
+                  vbox(std::move(v)))
+           | size(WIDTH, EQUAL, width) | bgcolor(Color::Black) | clear_under;
+}
+
+static Element build_launch_modal(const std::string &buf, int width) {
+    int inner = width - 6;
+    if (inner < 24) inner = 24;
+    Elements v;
+    v.push_back(text("  LAUNCH A PROCESS UNDER SUPERVISION  ")
+                | bold | color(Color::Black) | bgcolor(Color::CyanLight) | center);
+    v.push_back(text(""));
+    v.push_back(text(" Type a command to run under the seccomp harness.") | color(Color::GrayLight));
+    v.push_back(text(" Every risky syscall it makes will freeze for your approval.") | color(Color::GrayLight));
+    v.push_back(text(" The whole-system eBPF monitor keeps scoring it silently.") | dim);
+    v.push_back(text(""));
+    v.push_back(wrap_indent(" > " + buf + "_", inner, 3, Color::White, true));
+    v.push_back(text(""));
+    v.push_back(separator());
+    v.push_back(text("  [Enter] launch    [Esc] cancel") | color(Color::GrayLight));
+    v.push_back(text("  its stdout/stderr is captured — press [o] afterwards to read it") | dim);
+    v.push_back(text("  e.g.  ./bin/flood_trigger /tmp/fp.txt 1") | dim);
+    v.push_back(text("  e.g.  /bin/bash ./test/run_flood.sh") | dim);
+    return window(text(" SUPERVISE ") | bold | color(Color::CyanLight),
+                  vbox(std::move(v)))
+           | size(WIDTH, EQUAL, width) | bgcolor(Color::Black) | clear_under;
+}
+
+static Element build_supout_modal(const std::vector<std::string> &lines,
+                                  const std::string &inbuf, bool input_mode,
+                                  bool live, bool skip_on, std::uint32_t pid,
+                                  std::uint64_t gated, std::uint64_t auto_allowed,
+                                  const Keymap &km, int width, int height) {
+    int inner = width - 4;
+    if (inner < 32) inner = 32;
+
+    Elements body;
+    if (lines.empty()) {
+        body.push_back(text(" (no output captured — nothing has been supervised yet) ") | dim | center);
+    } else {
+        for (auto &l : lines)
+            body.push_back(wrap_indent(l, inner, 2, Color::GrayLight, false));
+    }
+
+    char meta[224];
+    std::snprintf(meta, sizeof(meta),
+        " %s | pid %u | gated: %llu | auto-allowed: %llu | skip-unmonitored: %s | lines: %zu ",
+        live ? "RUNNING" : "not running",
+        pid, (unsigned long long)gated, (unsigned long long)auto_allowed,
+        skip_on ? "ON" : "off", lines.size());
+
+    Elements v;
+    v.push_back(text(meta) | dim);
+    v.push_back(separator());
+    v.push_back(vbox(std::move(body)) | vscroll_indicator | yframe | focus | flex);
+    v.push_back(separator());
+
+    if (input_mode) {
+        v.push_back(wrap_indent(" > " + inbuf + "_", inner, 3, Color::White, true));
+        v.push_back(text("  [Enter] send to its stdin (empty Enter sends a blank line)    [Esc] leave input mode")
+                    | color(Color::GrayLight));
+    } else {
+        std::string hint = "  [" + km.key_for(KM_SUP_INPUT) + "] type into its stdin    ["
+                         + km.key_for(KM_SUP_SKIP) + "] toggle skip-unmonitored    ["
+                         + km.key_for(KM_SUP_VIEW) + "] / [Esc] close";
+        v.push_back(text(hint) | color(Color::GrayLight));
+        if (!live)
+            v.push_back(text("  (process has exited — stdin is closed)") | dim);
+    }
+
+    Color hdr = live ? Color::CyanLight : Color::GrayDark;
+    return window(text(" Supervised Process Output ") | bold | color(hdr),
+                  vbox(std::move(v)))
+           | size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height)
+           | bgcolor(Color::Black) | clear_under;
+}
+
+static std::vector<std::string> split_cmd(const std::string &s) {
+    std::vector<std::string> out;
+    std::istringstream iss(s);
+    std::string tok;
+    while (iss >> tok) out.push_back(tok);
+    return out;
 }
 
 void Ui::run() {
@@ -280,11 +428,22 @@ void Ui::run() {
     int sel = 0;
     bool new_only = false;
     bool paused = false;
-    bool modal_up = false;
-    PromptReq active;
+    ActiveModal modal = AM_NONE;
+    bool repman_dirty = true;
+    int repman_sel = 0;
+    bool show_keys = false;
+    bool keys_forced = false;
+    int keys_scroll = 0;
+    PromptReq ebpf_active;
+    SeccompPrompt sec_active;
+    std::string launch_buf;
+    std::string sup_buf;
+    bool sup_input = false;
     int roff = 0, hoff_l = 0;
     const int VIS_AUDIT = 10;
     const int RIGHT_W = 62;
+    const int KEYS_W = 34;
+    const int KEYS_AUTO_MIN = 170;
 
     Snapshot fsnap;
     std::vector<std::string> falerts;
@@ -292,13 +451,18 @@ void Ui::run() {
     double prev_t = 0.0, ema_rate = 0.0;
 
     auto renderer = Renderer([&]() {
-        if (!modal_up && tr_->prompts_enabled()) {
-            auto p = tr_->take_prompt();
-            if (p) { active = *p; modal_up = true; }
+        if (modal == AM_NONE || modal == AM_SUPOUT) {
+            SeccompPrompt sp;
+            if (sup_ && sup_->peek_prompt(sp)) { sec_active = sp; modal = AM_SECCOMP; sup_input = false; }
+            else if (modal == AM_NONE && tr_->prompts_enabled()) {
+                auto p = tr_->take_prompt();
+                if (p) { ebpf_active = *p; modal = AM_EBPF; }
+            }
         }
 
-        Snapshot snap = (paused && !modal_up) ? fsnap : tr_->snapshot();
-        std::vector<std::string> all = (paused && !modal_up) ? falerts : tr_->tail_alerts(999);
+        bool hold = (paused && modal == AM_NONE);
+        Snapshot snap = hold ? fsnap : tr_->snapshot();
+        std::vector<std::string> all = hold ? falerts : tr_->tail_alerts(999);
 
         {
             using namespace std::chrono;
@@ -324,85 +488,236 @@ void Ui::run() {
         if (wr > 0.0) std::snprintf(armed, sizeof(armed), "WARMUP %.0fs", wr);
         else          std::snprintf(armed, sizeof(armed), "ARMED");
 
-        char status[380];
+        std::string sup_state = "off";
+        if (sup_ && sup_->active())
+            sup_state = "pid " + std::to_string(sup_->child_pid());
+
+        char status[560];
         std::snprintf(status, sizeof(status),
-            " EDR | ev=%llu %.0f/s | kills=%llu burst=%llu dny=%llu hookfail=%llu | watch=%zu frozen=%zu blk=%zu | ENF:%s | %s | %s%s | e:enf X:clr space q ",
+            " EDR | ev=%llu %.0f/s | kills=%llu burst=%llu rep=%llu deny=%llu | watch=%zu frozen=%zu blk=%zu | supervise:%s | ENF:%s | %s | %s | [%s]launch [%s]output [%s]rep [%s]keys [%s]quit ",
             (unsigned long long)tr_->ev_count(), ema_rate,
             (unsigned long long)tr_->kills_issued(),
             (unsigned long long)tr_->burst_trips(),
+            (unsigned long long)tr_->rep_blocks(),
             (unsigned long long)tr_->denies(),
-            (unsigned long long)tr_->hooks_failed(),
             snap.watch_count, snap.frozen_count, tr_->blocks_active(),
+            sup_state.c_str(),
             tr_->enforcement_on() ? "on" : "OFF",
             armed, new_only ? "NEW" : "ALL",
-            paused ? " [PAUSED]" : "");
-        Color barcol = modal_up ? Color::Red : (paused ? Color::Magenta : Color::Blue);
+            km_.key_for(KM_LAUNCH).c_str(), km_.key_for(KM_SUP_VIEW).c_str(),
+            km_.key_for(KM_REPMAN).c_str(),
+            km_.key_for(KM_KEYPANE).c_str(), km_.key_for(KM_QUIT).c_str());
+        Color barcol = (modal == AM_SECCOMP) ? Color::CyanLight
+                     : (modal == AM_EBPF) ? Color::Red
+                     : (modal == AM_SUPOUT) ? Color::CyanLight
+                     : (modal != AM_NONE) ? Color::Red
+                     : (paused ? Color::Magenta : Color::Blue);
+
+        bool keys_visible = keys_forced ? show_keys : (screen.dimx() >= KEYS_AUTO_MIN);
+        bool keys_fit_docked = (screen.dimy() >= 34);
 
         int rw_inner = RIGHT_W - 4;
         auto right = vbox({
             build_gauges_pane(snap, rw_inner)     | size(HEIGHT, EQUAL, 9),
             build_watchlist_pane(snap, rw_inner)  | size(HEIGHT, EQUAL, 13),
-            build_masq_pane(snap, rw_inner)       | size(HEIGHT, EQUAL, 11),
+            build_masq_pane(snap, rw_inner)       | size(HEIGHT, EQUAL, 10),
             build_audit_pane(awin, rw_inner, roff) | flex
         });
+
+        Elements cols;
+        if (keys_visible && keys_fit_docked)
+            cols.push_back(build_keybind_pane(km_) | size(WIDTH, EQUAL, KEYS_W));
+        cols.push_back(build_tree_pane(snap, sel, new_only, hoff_l, modal == AM_NONE) | flex_grow);
+        cols.push_back(right | size(WIDTH, EQUAL, RIGHT_W));
+
         Element bview = vbox({
             wrap_indent(status, screen.dimx(), 0, Color::White, true) | bgcolor(barcol),
-            hbox({ build_tree_pane(snap, sel, new_only, hoff_l) | flex_grow,
-                   right | size(WIDTH, EQUAL, RIGHT_W) }) | flex
+            hbox(std::move(cols)) | flex,
+            build_legend()
         });
-        if (modal_up) {
-            int mw = std::min(78, screen.dimx() - 4);
-            return dbox({ bview | dim, build_modal(active, mw) | center });
+
+        if (modal == AM_SECCOMP) {
+            int mw = std::min(84, screen.dimx() - 4);
+            return dbox({ bview | dim, build_seccomp_modal(sec_active, km_, mw) | center });
+        }
+        if (modal == AM_EBPF) {
+            int mw = std::min(84, screen.dimx() - 4);
+            return dbox({ bview | dim, build_ebpf_modal(ebpf_active, km_, mw) | center });
+        }
+        if (modal == AM_LAUNCH) {
+            int mw = std::min(80, screen.dimx() - 4);
+            return dbox({ bview | dim, build_launch_modal(launch_buf, mw) | center });
+        }
+        if (modal == AM_SUPOUT) {
+            int mw = std::min(screen.dimx() - 4, std::max(60, screen.dimx() * 4 / 5));
+            int mh = std::max(12, screen.dimy() - 6);
+            std::vector<std::string> lines;
+            bool live = false, skip_on = false;
+            std::uint32_t cpid = 0;
+            std::uint64_t gated = 0, autoa = 0;
+            if (sup_) {
+                lines = sup_->output_lines((std::size_t)std::max(1, mh - 8));
+                live = sup_->active();
+                skip_on = sup_->skip_unscored();
+                cpid = sup_->child_pid();
+                gated = sup_->gated_count();
+                autoa = sup_->auto_allowed();
+            }
+            return dbox({ bview | dim,
+                          build_supout_modal(lines, sup_buf, sup_input, live, skip_on,
+                                             cpid, gated, autoa, km_, mw, mh) | center });
+        }
+        if (modal == AM_REPMAN) {
+            int rw = std::min(screen.dimx() - 4, std::max(60, screen.dimx() * 3 / 4));
+            return dbox({ bview | dim,
+                          build_repman_view(tr_, rw, repman_sel, repman_dirty) | center });
+        }
+        if (keys_visible && !keys_fit_docked) {
+            int kw = std::min(70, screen.dimx() - 4);
+            int kh = std::max(10, screen.dimy() - 6);
+            return dbox({ bview | dim, build_keybind_modal(km_, kw, kh, keys_scroll) | center });
         }
         return bview;
     });
 
     auto with_keys = CatchEvent(renderer, [&](Event e) {
-        if (modal_up) {
-            if (e == Event::Character('y') || e == Event::Character('Y')) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'y'); modal_up = false; return true;
-            }
-            if (e == Event::Character('n') || e == Event::Character('N')) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'n'); modal_up = false; return true;
-            }
-            if (e == Event::Character('b') || e == Event::Character('B')) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'b'); modal_up = false; return true;
-            }
-            if (e == Event::Character('k') || e == Event::Character('K')) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'k'); modal_up = false; return true;
-            }
-            if (e == Event::Character('w') || e == Event::Character('W')) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'w'); modal_up = false; return true;
-            }
-            if (e == Event::Escape) {
-                tr_->resolve_prompt(active.uid, active.pgid, 'x'); modal_up = false; return true;
+        if (modal == AM_SECCOMP) {
+            SeccompDecision d = SD_PENDING;
+            if (km_.matches(e, KM_ALLOW)) d = SD_ALLOW;
+            else if (km_.matches(e, KM_DENY)) d = SD_DENY;
+            else if (km_.matches(e, KM_KILL)) d = SD_KILL;
+            else if (km_.matches(e, KM_BLACKLIST)) d = SD_BLACKLIST;
+            else if (km_.matches(e, KM_WHITELIST)) d = SD_WHITELIST;
+            else if (e == Event::Escape) return true;
+            if (d != SD_PENDING) {
+                if (sup_) sup_->resolve(sec_active.token, d);
+                if (d == SD_BLACKLIST || d == SD_WHITELIST) repman_dirty = true;
+                modal = AM_NONE;
             }
             return true;
+        }
+        if (modal == AM_EBPF) {
+            char dec = 0;
+            if (km_.matches(e, KM_ALLOW)) dec = 'y';
+            else if (km_.matches(e, KM_DENY)) dec = 'n';
+            else if (km_.matches(e, KM_BLOCK)) dec = 'b';
+            else if (km_.matches(e, KM_BLACKLIST)) { dec = 'd'; repman_dirty = true; }
+            else if (km_.matches(e, KM_WHITELIST)) { dec = 'l'; repman_dirty = true; }
+            else if (km_.matches(e, KM_KILL)) dec = 'k';
+            else if (km_.matches(e, KM_SESSION_WL)) dec = 'w';
+            else if (e == Event::Escape) dec = 'x';
+            if (dec) { tr_->resolve_prompt(ebpf_active.uid, ebpf_active.pgid, dec); modal = AM_NONE; }
+            return true;
+        }
+        if (modal == AM_SUPOUT) {
+            if (sup_input) {
+                if (e == Event::Escape) { sup_input = false; return true; }
+                if (e == Event::Return) {
+                    if (sup_ && sup_->active())
+                        sup_->write_stdin(sup_buf);
+                    sup_buf.clear();
+                    return true;
+                }
+                if (e == Event::Backspace) {
+                    if (!sup_buf.empty()) sup_buf.pop_back();
+                    return true;
+                }
+                if (e.is_character()) {
+                    std::string ch = e.character();
+                    if (!ch.empty() && (unsigned char)ch[0] >= 0x20) sup_buf += ch;
+                    return true;
+                }
+                return true;
+            }
+            if (e == Event::Escape || km_.matches(e, KM_SUP_VIEW)) {
+                modal = AM_NONE; sup_buf.clear(); return true;
+            }
+            if (km_.matches(e, KM_SUP_INPUT)) {
+                if (sup_ && sup_->active()) sup_input = true;
+                return true;
+            }
+            if (km_.matches(e, KM_SUP_SKIP)) {
+                if (sup_) sup_->set_skip_unscored(!sup_->skip_unscored());
+                return true;
+            }
+            return true;
+        }
+        if (modal == AM_REPMAN) {
+            bool close_req = false;
+            repman_handle_key(tr_, e, km_, repman_sel, close_req);
+            if (close_req || e == Event::Escape) modal = AM_NONE;
+            return true;
+        }
+        if (modal == AM_LAUNCH) {
+            if (e == Event::Escape) { modal = AM_NONE; launch_buf.clear(); return true; }
+            if (e == Event::Return) {
+                auto argv = split_cmd(launch_buf);
+                modal = AM_NONE;
+                std::string lb = launch_buf;
+                launch_buf.clear();
+                if (!argv.empty() && sup_) {
+                    SeccompGates g;
+                    std::string err;
+                    if (sup_->launch(argv, g, err)) {
+                        tr_->push_alert("[SECCOMP] launched under supervision: " + lb);
+                        tr_->push_alert("[SECCOMP] press [" + km_.key_for(KM_SUP_VIEW)
+                                        + "] to view its output");
+                        sup_buf.clear();
+                        sup_input = false;
+                        modal = AM_SUPOUT;
+                    } else {
+                        tr_->push_alert("[SECCOMP] launch failed: " + err);
+                    }
+                }
+                return true;
+            }
+            if (e == Event::Backspace) {
+                if (!launch_buf.empty()) launch_buf.pop_back();
+                return true;
+            }
+            if (e.is_character()) {
+                std::string ch = e.character();
+                if (!ch.empty() && (unsigned char)ch[0] >= 0x20) launch_buf += ch;
+                return true;
+            }
+            return true;
+        }
+        if (keys_forced && show_keys && !(screen.dimy() >= 34)) {
+            if (e == Event::ArrowDown || km_.matches(e, KM_SEL_DOWN)) { keys_scroll++; return true; }
+            if (e == Event::ArrowUp || km_.matches(e, KM_SEL_UP)) { keys_scroll = std::max(0, keys_scroll - 1); return true; }
+            if (e == Event::Escape || km_.matches(e, KM_KEYPANE)) { show_keys = false; keys_scroll = 0; return true; }
         }
 
         Snapshot snap = paused ? fsnap : tr_->snapshot();
         auto rows = build_flat(snap, new_only);
         int max_sel = std::max(0, (int)rows.size() - 1);
 
-        if (e == Event::Character('q') || e == Event::Character('Q')) {
-            stop_.store(true); tr_->stop(); screen.ExitLoopClosure()(); return true;
+        if (km_.matches(e, KM_QUIT)) {
+            stop_.store(true); tr_->stop(); if (sup_) sup_->stop();
+            screen.ExitLoopClosure()(); return true;
         }
-        if (e == Event::Character(' ')) {
+        if (km_.matches(e, KM_LAUNCH)) { modal = AM_LAUNCH; launch_buf.clear(); return true; }
+        if (km_.matches(e, KM_SUP_VIEW)) {
+            modal = AM_SUPOUT; sup_input = false; sup_buf.clear(); return true;
+        }
+        if (km_.matches(e, KM_REPMAN)) { modal = AM_REPMAN; repman_dirty = true; repman_sel = 0; return true; }
+        if (km_.matches(e, KM_KEYPANE)) { keys_forced = true; show_keys = !show_keys; keys_scroll = 0; return true; }
+        if (km_.matches(e, KM_PAUSE)) {
             paused = !paused;
             if (paused) { fsnap = tr_->snapshot(); falerts = tr_->tail_alerts(999); }
             return true;
         }
-        if (e == Event::ArrowUp   || e == Event::Character('k')) { sel = std::max(0, sel - 1); return true; }
-        if (e == Event::ArrowDown || e == Event::Character('j')) { sel = std::min(max_sel, sel + 1); return true; }
+        if (e == Event::ArrowUp || km_.matches(e, KM_SEL_UP)) { sel = std::max(0, sel - 1); return true; }
+        if (e == Event::ArrowDown || km_.matches(e, KM_SEL_DOWN)) { sel = std::min(max_sel, sel + 1); return true; }
         if (e == Event::PageUp)   { sel = std::max(0, sel - 10); return true; }
         if (e == Event::PageDown) { sel = std::min(max_sel, sel + 10); return true; }
-        if (e == Event::Character('g')) { sel = 0; return true; }
-        if (e == Event::Character('G')) { sel = max_sel; return true; }
-        if (e == Event::Character('n')) { new_only = true; sel = 0; return true; }
-        if (e == Event::Character('a')) { new_only = false; sel = 0; return true; }
-        if (e == Event::Character('0')) { hoff_l = 0; return true; }
-        if (e == Event::Character('e')) { tr_->set_enforcement(!tr_->enforcement_on()); return true; }
-        if (e == Event::Character('X')) { tr_->flush_blocks(); return true; }
+        if (km_.matches(e, KM_SEL_TOP)) { sel = 0; return true; }
+        if (km_.matches(e, KM_SEL_BOTTOM)) { sel = max_sel; return true; }
+        if (km_.matches(e, KM_NEWONLY)) { new_only = true; sel = 0; return true; }
+        if (km_.matches(e, KM_ALL)) { new_only = false; sel = 0; return true; }
+        if (km_.matches(e, KM_RESET_H)) { hoff_l = 0; return true; }
+        if (km_.matches(e, KM_ENFORCE)) { tr_->set_enforcement(!tr_->enforcement_on()); return true; }
+        if (km_.matches(e, KM_CLEAR)) { tr_->flush_blocks(); return true; }
 
         if (e.is_mouse()) {
             auto m = e.mouse();
@@ -423,11 +738,12 @@ void Ui::run() {
 
     std::thread refresh([&]() {
         while (!stop_.load() && tr_->running()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            std::this_thread::sleep_for(std::chrono::milliseconds(120));
             screen.PostEvent(Event::Custom);
         }
     });
     screen.Loop(with_keys);
     stop_.store(true);
+    if (sup_) sup_->stop();
     if (refresh.joinable()) refresh.join();
 }
