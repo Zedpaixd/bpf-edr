@@ -29,10 +29,17 @@ static std::vector<KBRow> keybind_rows() {
         { nullptr, KM_ENFORCE, "toggle kernel enforcement", false },
         { nullptr, KM_CLEAR, "clear all active blocks", false },
         { nullptr, KM_LAUNCH, "launch a supervised process", false },
+        { nullptr, KM_SUP_VIEW, "view supervised output", false },
         { nullptr, KM_REPMAN, "open reputation manager", false },
         { nullptr, KM_KEYPANE, "toggle this help", false },
         { nullptr, KM_RESET_H, "reset horizontal scroll", false },
         { nullptr, KM_QUIT, "quit", false },
+
+        { "AUDIT LOG (right pane)", KM_COUNT, "", true },
+        { "   PgUp / PgDn   scroll through history", KM_COUNT, "", true },
+        { "   Home / End    oldest / live tail", KM_COUNT, "", true },
+        { "   wheel         scroll (hover right pane)", KM_COUNT, "", true },
+
         { "eBPF DECISION MODAL", KM_COUNT, "", true },
         { nullptr, KM_ALLOW, "allow (resume)", false },
         { nullptr, KM_DENY, "deny (keep suspended)", false },
@@ -41,52 +48,61 @@ static std::vector<KBRow> keybind_rows() {
         { nullptr, KM_BLACKLIST, "blacklist binary (hash)", false },
         { nullptr, KM_WHITELIST, "whitelist binary (hash)", false },
         { nullptr, KM_SESSION_WL, "session-only allow", false },
+
         { "SUPERVISED (seccomp) MODAL", KM_COUNT, "", true },
         { nullptr, KM_ALLOW, "allow this syscall", false },
         { nullptr, KM_DENY, "deny this syscall (EPERM)", false },
         { nullptr, KM_KILL, "deny and kill", false },
         { nullptr, KM_BLACKLIST, "blacklist binary (hash)", false },
         { nullptr, KM_WHITELIST, "whitelist binary (hash)", false },
+
+        { "SUPERVISED OUTPUT VIEW", KM_COUNT, "", true },
+        { nullptr, KM_SUP_INPUT, "type into its stdin", false },
+        { nullptr, KM_SUP_VIEW, "close the output view", false },
+
         { "REPUTATION MANAGER", KM_COUNT, "", true },
         { nullptr, KM_REP_PAUSE, "pause / resume a rule", false },
         { nullptr, KM_REP_REMOVE, "remove a rule", false },
+
         { "Esc always cancels / closes.", KM_COUNT, "", true },
     };
 }
 
-static Element render_kb_rows(const Keymap &km, int from, int count) {
+int keybind_row_count() { return (int)keybind_rows().size(); }
+
+ftxui::Element build_keybind_modal(const Keymap &km, int width, int height, int scroll) {
     auto rows = keybind_rows();
+    int n = (int)rows.size();
+    if (scroll < 0) scroll = 0;
+    if (scroll >= n) scroll = n - 1;
+
+    int inner = width - 4;
+    if (inner < 24) inner = 24;
+
     Elements v;
-    int shown = 0;
-    for (int i = from; i < (int)rows.size() && (count < 0 || shown < count); i++) {
+    for (int i = 0; i < n; i++) {
         auto &r = rows[i];
+        Element e;
         if (r.header) {
-            v.push_back(text(std::string(" ") + r.label) | bold | color(Color::Cyan));
+            e = uic::wrap_indent(std::string(" ") + r.label, inner, 1, Color::Cyan, true);
         } else {
             std::string key = km.key_for(r.action);
             if (key == " ") key = "spc";
             std::string line = " [" + key + "]";
             while (line.size() < 8) line += ' ';
             line += r.desc;
-            v.push_back(text(line) | color(Color::GrayLight));
+            e = uic::wrap_indent(line, inner, 8, Color::GrayLight, false);
         }
-        shown++;
+        if (i == scroll) e = e | focus;
+        v.push_back(e);
     }
-    return vbox(std::move(v));
-}
 
-ftxui::Element build_keybind_pane(const Keymap &km) {
-    return window(text(" Keybinds (?) ") | bold,
-                  render_kb_rows(km, 0, -1) | vscroll_indicator | yframe);
-}
+    char title[80];
+    std::snprintf(title, sizeof(title), " Keybinds — %d/%d — j/k or arrows, Esc closes ",
+                  scroll + 1, n);
 
-ftxui::Element build_keybind_modal(const Keymap &km, int width, int height, int scroll) {
-    auto rows = keybind_rows();
-    int maxscroll = std::max(0, (int)rows.size() - (height - 4));
-    if (scroll > maxscroll) scroll = maxscroll;
-    if (scroll < 0) scroll = 0;
-    return window(text(" Keybinds — scroll j/k or arrows, Esc closes ") | bold | color(Color::Cyan),
-                  render_kb_rows(km, scroll, height - 4))
+    return window(text(title) | bold | color(Color::Cyan),
+                  vbox(std::move(v)) | vscroll_indicator | yframe | flex)
            | size(WIDTH, EQUAL, width) | size(HEIGHT, EQUAL, height)
            | bgcolor(Color::Black) | clear_under;
 }
@@ -98,8 +114,8 @@ ftxui::Element build_repman_view(const std::shared_ptr<Tracker> &tr,
         g_repview = rep ? rep->list() : std::vector<RepEntry>();
         dirty = false;
     }
-    int inner = width - 4;
-    if (inner < 40) inner = 40;
+    int inner = width - 6;
+    if (inner < 32) inner = 32;
 
     Elements rows;
     if (g_repview.empty()) {
@@ -123,7 +139,7 @@ ftxui::Element build_repman_view(const std::shared_ptr<Tracker> &tr,
             else c = Color::Green;
             int indent = (int)head.size();
             Element row = uic::wrap_indent(head + body, inner, indent, c, (i == sel));
-            if (i == sel) row = row | inverted;
+            if (i == sel) row = row | inverted | focus;
             rows.push_back(row);
         }
     }
@@ -154,6 +170,13 @@ bool repman_handle_key(const std::shared_ptr<Tracker> &tr,
     if (e == Event::ArrowUp || km.matches(e, KM_SEL_UP)) { if (n > 0) sel = std::max(0, sel - 1); return true; }
     if (km.matches(e, KM_SEL_TOP)) { sel = 0; return true; }
     if (km.matches(e, KM_SEL_BOTTOM)) { sel = std::max(0, n - 1); return true; }
+    if (e.is_mouse()) {
+        ftxui::Event me = e;
+        auto m = me.mouse();
+        if (m.button == Mouse::WheelUp)   { if (n > 0) sel = std::max(0, sel - 1); return true; }
+        if (m.button == Mouse::WheelDown) { if (n > 0) sel = std::min(n - 1, sel + 1); return true; }
+        return true;
+    }
     if (n == 0) return true;
     auto rep = tr->reputation();
     if (!rep || sel < 0 || sel >= n) return true;

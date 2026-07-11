@@ -6,6 +6,7 @@
 #include "seccomp_supervisor.h"
 #include <ftxui/dom/elements.hpp>
 #include <ftxui/component/event.hpp>
+#include <ftxui/component/mouse.hpp>
 #include <atomic>
 #include <memory>
 #include <thread>
@@ -15,8 +16,8 @@ ftxui::Element build_repman_view(const std::shared_ptr<Tracker> &tr,
 bool repman_handle_key(const std::shared_ptr<Tracker> &tr,
                        const ftxui::Event &e, const Keymap &km,
                        int &sel, bool &close_req);
-ftxui::Element build_keybind_pane(const Keymap &km);
 ftxui::Element build_keybind_modal(const Keymap &km, int width, int height, int scroll);
+int keybind_row_count();
 
 class Ui {
 public:
