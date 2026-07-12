@@ -319,19 +319,25 @@ static Element build_seccomp_modal(const SeccompPrompt &p, const Keymap &km, int
 
     std::string riskline;
     Color rc = Color::GrayLight;
+    const char *who = p.has_parent ? "worker " : "eBPF confidence: ";
     if (!p.risk_known) {
-        riskline = "eBPF confidence: — (process not yet in eBPF model)";
+        riskline = std::string(who) + "— (not yet in eBPF model)";
     } else if (p.scores_ebpf) {
-        riskline = "eBPF confidence: " + fmt_pct(p.risk_current)
+        riskline = std::string(who) + fmt_pct(p.risk_current)
                  + "  ->  " + fmt_pct(p.risk_predicted) + " if allowed";
         rc = risk_color(p.risk_predicted);
     } else {
-        riskline = "eBPF confidence: " + fmt_pct(p.risk_current)
-                 + "  ->  " + fmt_pct(p.risk_current)
-                 + "  | Unmonitored syscall";
+        riskline = std::string(who) + fmt_pct(p.risk_current)
+                 + "  ->  " + fmt_pct(p.risk_current) + "  | Unmonitored syscall";
         rc = risk_color(p.risk_current);
     }
     v.push_back(wrap_indent(riskline, inner, 0, rc, true));
+    if (p.has_parent) {
+        std::string pcomm = p.parent_comm.empty() ? std::string("subtree") : p.parent_comm;
+        std::string pline = "subtree (" + pcomm + "): " + fmt_pct(p.parent_current)
+                          + "  ->  " + fmt_pct(p.parent_predicted);
+        v.push_back(wrap_indent(pline, inner, 0, risk_color(p.parent_current), true));
+    }
     v.push_back(text("  (held in-kernel until you decide)") | dim);
     v.push_back(text(""));
     v.push_back(separator());
@@ -376,7 +382,8 @@ static Element build_launch_modal(const std::string &buf, int width) {
 
 static Element build_supout_modal(const std::vector<std::string> &lines,
                                   const std::string &inbuf, bool input_mode,
-                                  bool live, std::uint32_t pid, std::uint64_t gated,
+                                  bool live, bool skip_on, std::uint32_t pid,
+                                  std::uint64_t gated, std::uint64_t autoa,
                                   const Keymap &km, int width, int height) {
     int inner = width - 6;
     if (inner < 32) inner = 32;
@@ -392,13 +399,15 @@ static Element build_supout_modal(const std::vector<std::string> &lines,
         }
     }
 
-    char meta[160];
-    std::snprintf(meta, sizeof(meta), " %s | pid %u | gated: %llu | lines: %zu ",
-        live ? "RUNNING" : "not running",
-        pid, (unsigned long long)gated, lines.size());
+    char meta[224];
+    std::snprintf(meta, sizeof(meta),
+        " %s | pid %u | gated: %llu | auto-allowed: %llu | skip-unmonitored: %s ",
+        live ? "RUNNING" : "not running", pid,
+        (unsigned long long)gated, (unsigned long long)autoa,
+        skip_on ? "ON" : "off");
 
     Elements v;
-    v.push_back(text(meta) | dim);
+    v.push_back(wrap_indent(meta, inner, 1, Color::GrayLight, false) | dim);
     v.push_back(separator());
     v.push_back(vbox(std::move(body)) | vscroll_indicator | yframe | flex);
     v.push_back(separator());
@@ -408,8 +417,9 @@ static Element build_supout_modal(const std::vector<std::string> &lines,
         v.push_back(text("  [Enter] send    [Esc] leave input mode") | color(Color::GrayLight));
     } else {
         std::string hint = "  [" + km.key_for(KM_SUP_INPUT) + "] stdin    ["
+                         + km.key_for(KM_SUP_SKIP) + "] skip-unmonitored    ["
                          + km.key_for(KM_SUP_VIEW) + "] / [Esc] close";
-        v.push_back(text(hint) | color(Color::GrayLight));
+        v.push_back(wrap_indent(hint, inner, 2, Color::GrayLight, false));
         if (!live) v.push_back(text("  (process exited — stdin closed)") | dim);
     }
 
@@ -543,18 +553,20 @@ void Ui::run() {
             int ow = std::min(screen.dimx() - 4, std::max(50, screen.dimx() * 4 / 5));
             int oh = std::max(12, screen.dimy() - 6);
             std::vector<std::string> lines;
-            bool live = false;
+            bool live = false, skip_on = false;
             std::uint32_t cpid = 0;
-            std::uint64_t gated = 0;
+            std::uint64_t gated = 0, autoa = 0;
             if (sup_) {
                 lines = sup_->output_lines(400);
                 live = sup_->active();
+                skip_on = sup_->skip_unmonitored();
                 cpid = sup_->child_pid();
                 gated = sup_->gated_count();
+                autoa = sup_->auto_allowed();
             }
             return dbox({ bview | dim,
-                          build_supout_modal(lines, sup_buf, sup_input, live, cpid, gated,
-                                             km_, ow, oh) | center });
+                          build_supout_modal(lines, sup_buf, sup_input, live, skip_on,
+                                             cpid, gated, autoa, km_, ow, oh) | center });
         }
         if (modal == AM_REPMAN) {
             int rw = std::min(screen.dimx() - 4, std::max(50, screen.dimx() * 3 / 4));
@@ -622,6 +634,10 @@ void Ui::run() {
             }
             if (km_.matches(e, KM_SUP_INPUT)) {
                 if (sup_ && sup_->active()) sup_input = true;
+                return true;
+            }
+            if (km_.matches(e, KM_SUP_SKIP)) {
+                if (sup_) sup_->set_skip_unmonitored(!sup_->skip_unmonitored());
                 return true;
             }
             return true;
@@ -717,6 +733,7 @@ void Ui::run() {
         if (km_.matches(e, KM_RESET_H)) { hoff_l = 0; return true; }
         if (km_.matches(e, KM_ENFORCE)) { tr_->set_enforcement(!tr_->enforcement_on()); return true; }
         if (km_.matches(e, KM_CLEAR)) { tr_->flush_blocks(); return true; }
+        if (km_.matches(e, KM_PURGE)) { tr_->purge_dead(false); return true; }
 
         if (e.is_mouse()) {
             auto m = e.mouse();

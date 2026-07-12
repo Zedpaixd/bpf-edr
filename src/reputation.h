@@ -25,6 +25,7 @@ public:
     bool save();
     std::string resolve_exe(std::uint32_t pid) const;
     static std::string hash_of_pid(std::uint32_t pid, bool &ok);
+    static std::string hash_of_file(const std::string &path, bool &ok);
     bool is_blacklisted(const std::string &hash) const;
     bool is_whitelisted(const std::string &hash) const;
     bool add(std::uint8_t kind, const std::string &hash,

@@ -82,6 +82,12 @@ std::string Reputation::hash_of_pid(std::uint32_t pid, bool &ok) {
     return Sha256::file_hex(link, ok);
 }
 
+std::string Reputation::hash_of_file(const std::string &path, bool &ok) {
+    ok = false;
+    if (path.empty()) return std::string();
+    return Sha256::file_hex(path.c_str(), ok);
+}
+
 void Reputation::load() {
     std::lock_guard<std::mutex> lk(mtx_);
     entries_.clear();

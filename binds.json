@@ -6,6 +6,7 @@
     "pause_dashboard": " ",
     "toggle_enforcement": "e",
     "clear_blocks": "X",
+    "purge_dead": "D",
     "filter_new_only": "n",
     "filter_all": "a",
     "reset_hscroll": "0",
@@ -23,5 +24,6 @@
     "repman_pause": "p",
     "repman_remove": "x",
     "supervised_view": "o",
-    "supervised_input": "i"
+    "supervised_input": "i",
+    "supervised_skip_unmonitored": "u"
 }

@@ -33,6 +33,10 @@ struct SeccompPrompt {
     double risk_predicted = -1.0;
     bool risk_known = false;
     bool scores_ebpf = false;
+    bool has_parent = false;
+    double parent_current = -1.0;
+    double parent_predicted = -1.0;
+    std::string parent_comm;
 };
 
 class Tracker;
@@ -53,6 +57,10 @@ public:
     std::vector<std::string> output_lines(std::size_t max_lines);
     void write_stdin(const std::string &line);
 
+    void set_skip_unmonitored(bool on) { skip_unmon_.store(on); }
+    bool skip_unmonitored() const { return skip_unmon_.load(); }
+    std::uint64_t auto_allowed() const { return auto_allowed_.load(); }
+
     void stop();
     bool active() const { return active_.load(); }
     std::uint32_t child_pid() const { return child_pid_.load(); }
@@ -68,8 +76,10 @@ private:
     std::thread reader_thread_;
     std::atomic<bool> active_{false};
     std::atomic<bool> stop_{false};
+    std::atomic<bool> skip_unmon_{true};
     std::atomic<std::uint32_t> child_pid_{0};
     std::atomic<std::uint64_t> gated_{0};
+    std::atomic<std::uint64_t> auto_allowed_{0};
     std::atomic<std::uint64_t> token_seq_{1};
     int notify_fd_ = -1;
     int pty_master_ = -1;

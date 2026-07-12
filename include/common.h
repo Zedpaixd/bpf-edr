@@ -8,6 +8,7 @@
 #endif
 
 #define MAX_ARG_LEN 256
+#define MAX_PATH_LEN 256
 #define MAX_COMM 16
 #define MAX_NAME 64
 #define BURST_FP_SCALE 65536
@@ -68,7 +69,7 @@ struct edr_event {
     __u32 _pad1;
     char  comm[MAX_COMM];
     union {
-        struct { char argbuf[MAX_ARG_LEN]; } exec;
+        struct { char argbuf[MAX_ARG_LEN]; char filename[MAX_PATH_LEN]; } exec;
         struct { __u64 addr; __u64 len; __u32 prot; __u32 _p; } mprot;
         struct { __u32 ret_fd; __u32 _p; char name[MAX_NAME]; } memfd;
         struct { char new_name[MAX_COMM]; } rename;
@@ -78,7 +79,7 @@ struct edr_event {
         struct { __u32 daddr; __u16 dport; __u16 _p; __u32 saddr; } net;
         struct { __u8 klass; __u8 _p[7]; } deny;
         struct { __u32 weight_fp; __u32 _p; } burst;
-        __u8  _raw[MAX_ARG_LEN];
+        __u8  _raw[MAX_ARG_LEN + MAX_PATH_LEN];
     } data __attribute__((aligned(8)));
 } __attribute__((aligned(8)));
 

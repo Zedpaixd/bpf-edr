@@ -245,6 +245,8 @@ int tp_execve(struct trace_event_raw_sys_enter *ctx) {
     if (!e) return 0;
     fill_meta(e);
     __builtin_memcpy(e->data.exec.argbuf, s->buf, MAX_ARG_LEN);
+    bpf_probe_read_user_str(e->data.exec.filename, MAX_PATH_LEN,
+                            (const char *)ctx->args[0]);
     bpf_ringbuf_submit(e, 0);
     return 0;
 }
@@ -261,6 +263,8 @@ int tp_execveat(struct trace_event_raw_sys_enter *ctx) {
     if (!e) return 0;
     fill_meta(e);
     __builtin_memcpy(e->data.exec.argbuf, s->buf, MAX_ARG_LEN);
+    bpf_probe_read_user_str(e->data.exec.filename, MAX_PATH_LEN,
+                            (const char *)ctx->args[1]);
     bpf_ringbuf_submit(e, 0);
     return 0;
 }

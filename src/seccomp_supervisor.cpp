@@ -106,6 +106,7 @@ bool SeccompSupervisor::launch(const std::vector<std::string> &argv,
     child_pid_.store((std::uint32_t)child);
     if (tr_) tr_->register_supervised((std::uint32_t)child);
     gated_.store(0);
+    auto_allowed_.store(0);
     stop_.store(false);
     {
         std::lock_guard<std::mutex> lk(out_mtx_);
@@ -259,6 +260,19 @@ void SeccompSupervisor::supervise() {
             p.scores_ebpf = rp.scores;
             p.comm = rp.comm;
             p.exe_path = rp.exe_path;
+            p.has_parent = rp.has_parent;
+            p.parent_current = rp.parent_current;
+            p.parent_predicted = rp.parent_predicted;
+            p.parent_comm = rp.parent_comm;
+        }
+
+        if (skip_unmon_.load() && !p.scores_ebpf) {
+            std::memset(resp, 0, sizes.seccomp_notif_resp);
+            resp->id = req->id;
+            resp->flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE;
+            ioctl(notify_fd_, SECCOMP_IOCTL_NOTIF_SEND, resp);
+            auto_allowed_.fetch_add(1);
+            continue;
         }
 
         {
@@ -304,10 +318,13 @@ void SeccompSupervisor::supervise() {
         }
 
         ioctl(notify_fd_, SECCOMP_IOCTL_NOTIF_SEND, resp);
-
+        if (tr_ && (d == SD_ALLOW || d == SD_WHITELIST))
+            tr_->commit_syscall_evidence(p.pid, nr, p.args[0], p.args[2]);
         if (do_kill) {
             std::uint32_t cp = child_pid_.load();
-            if (cp > 1) kill((pid_t)cp, SIGKILL);
+            if (tr_ && cp > 1) tr_->kill_supervised_tree(cp);
+            if (cp > 1) kill(-(pid_t)cp, SIGKILL);
+            if (notify_fd_ >= 0) { ::close(notify_fd_); notify_fd_ = -1; }
             break;
         }
     }
@@ -317,6 +334,8 @@ void SeccompSupervisor::supervise() {
 
     std::uint32_t cp = child_pid_.load();
     if (cp > 1) { int st; waitpid((pid_t)cp, &st, WNOHANG); }
+    if (tr_ && cp > 1) tr_->unregister_supervised(cp);
+    if (tr_ && cp > 1) tr_->mark_dead(cp);
     {
         std::lock_guard<std::mutex> lk(out_mtx_);
         out_lines_.push_back("[supervised process ended]");

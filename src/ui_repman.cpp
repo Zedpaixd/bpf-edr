@@ -28,6 +28,7 @@ static std::vector<KBRow> keybind_rows() {
         { nullptr, KM_PAUSE, "pause / resume view", false },
         { nullptr, KM_ENFORCE, "toggle kernel enforcement", false },
         { nullptr, KM_CLEAR, "clear all active blocks", false },
+        { nullptr, KM_PURGE, "purge dead processes from tree", false },
         { nullptr, KM_LAUNCH, "launch a supervised process", false },
         { nullptr, KM_SUP_VIEW, "view supervised output", false },
         { nullptr, KM_REPMAN, "open reputation manager", false },
@@ -58,6 +59,7 @@ static std::vector<KBRow> keybind_rows() {
 
         { "SUPERVISED OUTPUT VIEW", KM_COUNT, "", true },
         { nullptr, KM_SUP_INPUT, "type into its stdin", false },
+        { nullptr, KM_SUP_SKIP, "toggle skip-unmonitored syscalls", false },
         { nullptr, KM_SUP_VIEW, "close the output view", false },
 
         { "REPUTATION MANAGER", KM_COUNT, "", true },

@@ -47,6 +47,8 @@ struct ProcNode {
     bool   supervised = false;
     std::weak_ptr<ProcNode> parent;
     std::vector<std::shared_ptr<ProcNode>> children;
+    std::string cached_hash;
+    std::string cached_path;
 };
 
 struct SnapNode {
@@ -127,6 +129,10 @@ struct RiskPrediction {
     double predicted = -1.0;
     std::string comm;
     std::string exe_path;
+    bool has_parent = false;
+    double parent_current = -1.0;
+    double parent_predicted = -1.0;
+    std::string parent_comm;
 };
 
 class Tracker {
@@ -166,7 +172,12 @@ public:
     void unregister_supervised(std::uint32_t tgid);
     RiskPrediction predict_for_syscall(std::uint32_t tgid, int syscall_nr,
                                        std::uint64_t a0, std::uint64_t a1, std::uint64_t a2);
+    void commit_syscall_evidence(std::uint32_t tgid, int syscall_nr,
+                                 std::uint64_t a0, std::uint64_t a2);
     void seccomp_persist_hash(std::uint32_t tgid, bool blacklist);
+    void mark_dead(std::uint32_t tgid);
+    std::size_t purge_dead(bool force);
+    std::size_t kill_supervised_tree(std::uint32_t root_tgid);
 
 private:
     EngineCfg cfg_;
@@ -205,6 +216,7 @@ private:
     std::shared_ptr<ProcNode> lookup_by_pid(std::uint32_t tgid);
     std::shared_ptr<ProcNode> ensure_node(const edr_event &e);
     std::shared_ptr<ProcNode> fork_node(const edr_event &e);
+    std::shared_ptr<ProcNode> synth_node(std::uint32_t tgid, bool supervised);
     std::string ev_key(std::uint8_t t) const;
     bool self_pid(std::uint32_t pid, std::uint32_t pgid) const;
     bool is_self(const edr_event &e) const;
